@@ -1,118 +1,178 @@
 # StackAI RAG Assessment
 
-Implementation of a Retrieval-Augmented Generation (RAG) system for the StackAI Forward Deployed Engineer take-home assessment.
+Backend implementation for PDF ingestion and hybrid retrieval (keyword + semantic) for the StackAI FDE take-home assessment.
 
-## Features
+## Current Scope
 
-- PDF ingestion with page-aware chunking
-- Semantic and keyword retrieval
-- Mistral LLM integration
-- FastAPI backend
-- Simple chat UI
+- FastAPI backend only
+- PDF ingestion with dedupe and OCR fallback
+- Local JSONL storage (no vector database)
+- Intent-gated query processing
+- Hybrid retrieval: BM25-style keyword + embedding semantic search
+- Score fusion and conservative reranking tie-breaker
+- Embedding persistence and warmup endpoint
 
-## Implemented So Far: PDF Ingestion
+Out of scope:
 
-The ingestion backend is implemented with FastAPI and stores parsed data locally (no vector DB).
+- Chat UI
+- Generation/answer synthesis
 
-### Endpoint
+## API Endpoints
 
-- Method: `POST`
-- Path: `/ingestion/pdfs`
-- Payload: `multipart/form-data` with one or more `files`
-- Accepted type: `.pdf` only
-- Response groups files into `ingested`, `skipped` (for duplicates), and `failed`
-- Reset endpoint: `DELETE /ingestion/reset` clears uploaded files and JSONL records
+- `GET /health`
+- `POST /ingestion/pdfs`
+- `DELETE /ingestion/reset`
+- `POST /query`
+- `POST /embeddings/warmup`
 
-### Ingestion Flow
+## Ingestion
 
-1. Validate files (extension and max size limit).
-2. Parse PDF pages with `pypdf`.
-3. Extract page text and normalize whitespace.
-4. Chunk text with overlap using a page-aware algorithm.
-5. Persist:
-	 - Original file in `data/uploads/`
-	 - Document metadata in `data/records/documents.jsonl`
-	 - Chunk records in `data/records/chunks.jsonl`
+`POST /ingestion/pdfs`
 
-### OCR Fallback For Scanned/Fuzzy PDFs
+- Accepts `multipart/form-data` with one or more `files`
+- Accepts `.pdf` only
+- Validates max file size
+- Deduplicates by SHA-256
+- Extracts text with `pypdf`
+- Falls back to Mistral OCR when extraction is empty
+- Chunks text with overlap and page provenance
+- Persists:
+  - Uploaded files in `data/uploads/`
+  - Documents in `data/records/documents.jsonl`
+  - Chunks in `data/records/chunks.jsonl`
 
-If native PDF extraction returns no text (common for scanned or low-quality PDFs), ingestion falls back to Mistral OCR.
+`DELETE /ingestion/reset`
 
-- Trigger condition: all pages are empty after `pypdf` extraction.
-- OCR provider: Mistral OCR model (default `mistral-ocr-latest`).
-- Required env var: `MISTRAL_API_KEY`.
+- Clears uploads, documents, chunks, and cached embeddings
 
-Optional env vars:
+## Retrieval Pipeline
 
-- `OCR_FALLBACK_ENABLED=true|false` (default `true`)
-- `MISTRAL_OCR_MODEL` (default `mistral-ocr-latest`)
+`POST /query`
 
-### Chunking Considerations
+1. Normalize and classify intent.
+2. Skip retrieval for non-search conversational input.
+3. Rewrite query when useful (filler stripping, acronym expansion, topic extraction).
+4. Run keyword retrieval across query variants.
+5. Run semantic retrieval with cached chunk embeddings.
+6. Fuse normalized keyword and semantic scores.
+7. Apply conservative short-query source-consistency tie-breaker when conditions are met.
+8. Apply evidence gating:
+   - relevance threshold
+   - query-term coverage threshold
 
-The chunking algorithm is custom and designed for retrieval quality while keeping implementation simple:
+Response statuses currently used:
 
-- Uses paragraph-first packing to preserve local context.
-- Splits oversized text near sentence boundaries (`.`, `!`, `?`, newline) when possible.
-- Falls back to whitespace or hard cuts if needed.
-- Adds configurable overlap to reduce boundary information loss.
-- Drops very small fragments by default (`min_chunk_chars`) to avoid noisy retrieval units.
-- Keeps page provenance (`page_start`, `page_end`) for citation-friendly downstream results.
+- `search_not_required`
+- `retrieval_complete`
+- `insufficient_evidence`
 
-Default parameters are configurable in `app/config.py`:
+Diagnostics include:
 
-- `chunk_size_chars=1200`
-- `chunk_overlap_chars=180`
-- `min_chunk_chars=250`
+- `intent`
+- `reason`
+- `rewrite_notes`
+- `topic_query`
+- `retrieval_queries`
 
-### Why This Strategy
+## Embeddings and Rate Limits
 
-- Better than fixed-size raw slicing for preserving semantic coherence.
-- Lightweight and deterministic (good for debugging and explainability).
-- Compatible with both keyword and semantic retrieval in later pipeline stages.
+Semantic retrieval uses Mistral embeddings.
 
-### File Layout
+Required:
 
-- API entrypoint: `app/main.py`
-- PDF extraction: `app/ingestion/pdf_ingestor.py`
-- Chunking logic: `app/ingestion/chunker.py`
-- Local persistence: `app/storage/document_store.py`
-- Request/response schemas: `app/schemas.py`
+- `MISTRAL_API_KEY`
 
-## Running (uv Native)
+Optional:
 
-1. Create and activate a virtual environment:
+- `MISTRAL_EMBEDDING_MODEL` (default `mistral-embed`)
+
+Persistence:
+
+- Chunk embeddings are stored in `data/records/chunk_embeddings.jsonl`
+- Missing chunk embeddings are generated and appended during query-time retrieval
+
+Warmup endpoint:
+
+- `POST /embeddings/warmup`
+- Optional query params:
+  - `force_rebuild=true`
+  - `max_chunks=<N>`
+
+Rate-limit resilience:
+
+- Request pacing (`embedding_min_request_interval_seconds`)
+- 429 retries with exponential backoff (`embedding_max_retries_on_rate_limit`, `embedding_retry_base_delay_seconds`)
+
+## Run Locally (uv)
+
+1. Create and activate environment:
 
 ```bash
 uv venv .venv
 source .venv/bin/activate
 ```
 
-2. Install dependencies from lockfile/project metadata:
+2. Install dependencies:
 
 ```bash
 uv sync --active
 ```
 
-3. Run the API through uv:
+3. Start API:
 
 ```bash
 uv run --active uvicorn app.main:app --reload
 ```
 
-4. Test ingestion:
+## Quick Test Commands
+
+Ingest:
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/ingestion/pdfs" \
-	-F "files=@/absolute/path/to/file1.pdf" \
-	-F "files=@/absolute/path/to/file2.pdf"
+  -F "files=@/absolute/path/to/file1.pdf" \
+  -F "files=@/absolute/path/to/file2.pdf"
+```
 
-# Optional: clear all ingested data
+Warm embeddings:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/embeddings/warmup"
+```
+
+Query examples:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"hello"}'
+
+curl -X POST "http://127.0.0.1:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"gradient descent","top_k":7}'
+
+curl -X POST "http://127.0.0.1:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What does the document say about gradient descent?","top_k":7}'
+```
+
+Reset:
+
+```bash
 curl -X DELETE "http://127.0.0.1:8000/ingestion/reset"
 ```
 
-## Notes
+## Key Files
 
-- Current implementation focuses on ingestion only.
-- Query transformation, retrieval fusion, reranking, generation, UI, and safety policies are next.
-- Dependencies are managed with `uv` via `pyproject.toml` and `uv.lock`.
+- API orchestration: `app/main.py`
+- Query processing: `app/retrieval/query_processor.py`
+- Keyword retrieval: `app/retrieval/keyword_search.py`
+- Semantic retrieval: `app/retrieval/semantic_search.py`
+- Embedding client: `app/retrieval/embeddings.py`
+- PDF ingestion: `app/ingestion/pdf_ingestor.py`
+- Chunking: `app/ingestion/chunker.py`
+- Document store: `app/storage/document_store.py`
+- Embedding store: `app/storage/embedding_store.py`
+- Schemas: `app/schemas.py`
+- Settings: `app/config.py`
 
