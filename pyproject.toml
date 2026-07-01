@@ -1,0 +1,21 @@
+[project]
+name = "stackai-rag"
+version = "0.1.0"
+description = "FastAPI backend for PDF ingestion in a custom RAG pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "pydantic-settings==2.7.1",
+    "python-multipart==0.0.20",
+    "pypdf==5.2.0",
+    "mistralai==1.9.11",
+]
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false

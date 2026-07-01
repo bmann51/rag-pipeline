@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .vscode/
+data/uploads/*
+data/records/*.jsonl
+!data/uploads/.gitkeep
+!data/records/.gitkeep
