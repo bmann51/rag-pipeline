@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     embedding_max_retries_on_rate_limit: int = 3
     embedding_retry_base_delay_seconds: float = 1.0
 
+    generation_enabled: bool = False
+    mistral_chat_model: str = "mistral-small-latest"
+    generation_temperature: float = 0.2
+    generation_max_tokens: int = 600
+    generation_min_top_relevance_score: float = 0.45
+    generation_min_avg_relevance_score: float = 0.4
+    generation_max_chunks: int = 4
+    generation_max_chars_per_chunk: int = 1600
+
     ocr_fallback_enabled: bool = True
     mistral_api_key: str | None = None
     mistral_ocr_model: str = "mistral-ocr-latest"

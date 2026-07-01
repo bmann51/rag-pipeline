@@ -96,3 +96,5 @@ class QueryResponse(BaseModel):
     diagnostics: QueryDiagnostics
     retrieved_chunks: list[RetrievedChunk] = Field(default_factory=list)
     total_chunks_searched: int = 0
+    generated_answer: str | None = None
+    cited_chunk_ids: list[str] = Field(default_factory=list)

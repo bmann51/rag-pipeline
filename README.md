@@ -11,11 +11,12 @@ Backend implementation for PDF ingestion and hybrid retrieval (keyword + semanti
 - Hybrid retrieval: BM25-style keyword + embedding semantic search
 - Score fusion and conservative reranking tie-breaker
 - Embedding persistence and warmup endpoint
+- Optional grounded answer generation with Mistral
 
 Out of scope:
 
 - Chat UI
-- Generation/answer synthesis
+- Multi-turn chat memory/agentic workflows
 
 ## API Endpoints
 
@@ -59,6 +60,7 @@ Out of scope:
 8. Apply evidence gating:
    - relevance threshold
    - query-term coverage threshold
+9. Optionally generate a grounded answer with citations from retrieved chunks.
 
 Response statuses currently used:
 
@@ -74,6 +76,11 @@ Diagnostics include:
 - `topic_query`
 - `retrieval_queries`
 
+When generation is enabled and succeeds, query responses also include:
+
+- `generated_answer`
+- `cited_chunk_ids`
+
 ## Embeddings and Rate Limits
 
 Semantic retrieval uses Mistral embeddings.
@@ -85,6 +92,7 @@ Required:
 Optional:
 
 - `MISTRAL_EMBEDDING_MODEL` (default `mistral-embed`)
+- `MISTRAL_CHAT_MODEL` (default `mistral-small-latest`)
 
 Persistence:
 
@@ -102,6 +110,66 @@ Rate-limit resilience:
 
 - Request pacing (`embedding_min_request_interval_seconds`)
 - 429 retries with exponential backoff (`embedding_max_retries_on_rate_limit`, `embedding_retry_base_delay_seconds`)
+
+Generation behavior:
+
+- Disabled by default (`generation_enabled=false`).
+- Runs only for `retrieval_complete` responses.
+- Skips generation when retrieval confidence is too low.
+- Falls back to retrieval-only output if generation fails (non-fatal).
+
+## Validation Status (Current)
+
+What has been validated so far:
+
+- Retrieval pipeline is stable across intent-gated, in-domain, and out-of-domain queries.
+- Hybrid retrieval (keyword + semantic + fusion) is returning expected `status` values.
+- Embedding persistence and warmup are working (`chunk_embeddings.jsonl` reuse verified).
+- Optional generation path is active and returns grounded answers with chunk citations on many factual queries.
+- Citation IDs in responses are validated against retrieved chunk IDs.
+
+Known gaps observed:
+
+- Answer generation is not yet fully consistent on all answerable questions.
+- Some answerable prompts still return retrieval evidence but no generated answer when citation formatting from the model is weak.
+- For ambiguous short phrases, top-source selection can occasionally drift across documents depending on wording.
+
+## Remaining Testing (Next Round)
+
+When additional PDFs/domains are loaded, run these checks:
+
+1. Corpus coverage checks
+  - Build a small answer key per new document (10-20 factual questions with expected phrases).
+  - Measure: status accuracy, evidence hit rate, answer hit rate, citation validity.
+2. Cross-document ambiguity checks
+  - Test short overlapping terms that may appear in multiple documents.
+  - Confirm top results come from intended source when query context implies one document/domain.
+3. Citation robustness checks
+  - Verify generated answers contain valid `cited_chunk_ids` mapped to returned chunks.
+  - Track how often generation is skipped due to missing/invalid citations.
+4. Out-of-corpus safety checks
+  - Validate that unsupported questions continue to return `insufficient_evidence`.
+5. Scale/performance checks
+  - Re-run warmup + query batches after adding files to confirm no rate-limit regressions.
+  - Confirm generation remains non-fatal under transient model/API failures.
+
+Suggested acceptance bar for next pass:
+
+- `status` correctness: >= 95%
+- evidence contains expected facts (for answerable set): >= 90%
+- generated answer contains expected facts (for answerable set): >= 80%
+- citation validity (generated answers): 100%
+
+Reusable scorecard command:
+
+```bash
+/Users/brianmann/git/stackai/.venv/bin/python scripts/qa_scorecard.py
+```
+
+Optional:
+
+- `--cases path/to/cases.json` to run a custom answer-key set
+- `--save reports/qa_scorecard.json` to save full results
 
 ## Run Locally (uv)
 

@@ -9,6 +9,7 @@ from app.retrieval.embeddings import EmbeddingClient
 from app.retrieval.keyword_search import KeywordSearcher
 from app.retrieval.query_processor import QueryProcessor
 from app.retrieval.semantic_search import SemanticSearcher
+from app.retrieval.answer_generator import AnswerGenerator
 from app.schemas import (
     ClearIngestionResponse,
     ChunkRecord,
@@ -41,6 +42,14 @@ embedding_client = EmbeddingClient(
 )
 semantic_searcher = SemanticSearcher(embedding_client)
 query_processor = QueryProcessor()
+answer_generator = AnswerGenerator(
+    api_key=settings.mistral_api_key,
+    model=settings.mistral_chat_model,
+    temperature=settings.generation_temperature,
+    max_tokens=settings.generation_max_tokens,
+    max_chunks=settings.generation_max_chunks,
+    max_chars_per_chunk=settings.generation_max_chars_per_chunk,
+)
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 
@@ -371,6 +380,32 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     else:
         diagnostics.reason = "Query passed intent gate. Keyword and semantic retrieval completed."
 
+    generated_answer: str | None = None
+    cited_chunk_ids: list[str] = []
+    if settings.generation_enabled:
+        top_relevance_score = max(chunk.relevance_score for chunk in retrieved_chunks)
+        avg_relevance_score = sum(chunk.relevance_score for chunk in retrieved_chunks) / len(retrieved_chunks)
+        low_confidence = (
+            top_relevance_score < settings.generation_min_top_relevance_score
+            or avg_relevance_score < settings.generation_min_avg_relevance_score
+        )
+        if low_confidence:
+            diagnostics.rewrite_notes.append(
+                "Skipped answer generation due to low retrieval confidence."
+            )
+        else:
+            generation_result = answer_generator.generate_answer(
+                query=original_query,
+                retrieved_chunks=retrieved_chunks,
+            )
+            if generation_result.error:
+                diagnostics.rewrite_notes.append(
+                    f"Answer generation unavailable: {generation_result.error}"
+                )
+            else:
+                generated_answer = generation_result.answer
+                cited_chunk_ids = generation_result.cited_chunk_ids
+
     return QueryResponse(
         original_query=original_query,
         processed_query=processed_query,
@@ -379,6 +414,8 @@ def query_documents(request: QueryRequest) -> QueryResponse:
         diagnostics=diagnostics,
         retrieved_chunks=retrieved_chunks,
         total_chunks_searched=len(chunks),
+        generated_answer=generated_answer,
+        cited_chunk_ids=cited_chunk_ids,
     )
 
 
