@@ -92,7 +92,6 @@ class QueryResponse(BaseModel):
     status: Literal[
         "search_not_required",
         "query_refused",
-        "ready_for_retrieval",
         "retrieval_complete",
         "insufficient_evidence",
     ]
