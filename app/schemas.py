@@ -102,3 +102,5 @@ class QueryResponse(BaseModel):
     generated_answer: str | None = None
     cited_chunk_ids: list[str] = Field(default_factory=list)
     disclaimer: str | None = None
+    hallucination_warning: bool = False
+    unsupported_sentences: list[str] = Field(default_factory=list)

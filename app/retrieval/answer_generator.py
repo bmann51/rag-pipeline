@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mistralai import Mistral
 
@@ -12,6 +12,14 @@ UUID_PATTERN = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"
 )
 WORD_PATTERN = re.compile(r"[a-z0-9]{3,}", re.IGNORECASE)
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
+_HEDGE_PHRASES = (
+    "i don't have enough evidence",
+    "i do not have enough evidence",
+    "insufficient evidence",
+    "cannot answer",
+    "i do not have",
+)
 
 _CITE_RULE = (
     "Cite every factual claim inline using the chunk ID in square brackets, e.g. [chunk-id]. "
@@ -47,6 +55,8 @@ class AnswerGenerationResult:
     answer: str | None
     cited_chunk_ids: list[str]
     error: str | None = None
+    unsupported_sentences: list[str] = field(default_factory=list)
+    hallucination_warning: bool = False
 
 
 class AnswerGenerator:
@@ -116,7 +126,14 @@ class AnswerGenerator:
                 error="Generated answer did not contain valid citations.",
             )
 
-        return AnswerGenerationResult(answer=content.strip(), cited_chunk_ids=cited_chunk_ids, error=None)
+        unsupported, warning = self._check_sentence_support(content.strip(), limited_chunks)
+        return AnswerGenerationResult(
+            answer=content.strip(),
+            cited_chunk_ids=cited_chunk_ids,
+            error=None,
+            unsupported_sentences=unsupported,
+            hallucination_warning=warning,
+        )
 
     def generate_answer(
         self,
@@ -159,7 +176,49 @@ class AnswerGenerator:
                 error="Generated answer did not contain valid citations.",
             )
 
-        return AnswerGenerationResult(answer=content.strip(), cited_chunk_ids=cited_chunk_ids, error=None)
+        unsupported, warning = self._check_sentence_support(content.strip(), limited_chunks)
+        return AnswerGenerationResult(
+            answer=content.strip(),
+            cited_chunk_ids=cited_chunk_ids,
+            error=None,
+            unsupported_sentences=unsupported,
+            hallucination_warning=warning,
+        )
+
+    @staticmethod
+    def _check_sentence_support(
+        answer: str,
+        chunks: list[RetrievedChunk],
+        *,
+        min_meaningful_words: int = 5,
+        overlap_threshold: float = 0.15,
+    ) -> tuple[list[str], bool]:
+        chunk_term_sets = [
+            set(t.lower() for t in WORD_PATTERN.findall(chunk.text))
+            for chunk in chunks
+        ]
+        unsupported: list[str] = []
+        for sentence in _SENTENCE_SPLIT.split(answer.strip()):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            lowered = sentence.lower()
+            if any(hedge in lowered for hedge in _HEDGE_PHRASES):
+                continue
+            stripped_citations = CITATION_PATTERN.sub("", sentence).strip()
+            if not stripped_citations:
+                continue
+            terms = set(t.lower() for t in WORD_PATTERN.findall(stripped_citations))
+            if len(terms) < min_meaningful_words:
+                continue
+            best_overlap = max(
+                (len(terms & chunk_terms) / len(terms) for chunk_terms in chunk_term_sets if chunk_terms),
+                default=0.0,
+            )
+            if best_overlap < overlap_threshold:
+                unsupported.append(sentence)
+
+        return unsupported, bool(unsupported)
 
     def _extract_citations(self, content: str, valid_chunk_ids: set[str]) -> list[str]:
         seen: set[str] = set()

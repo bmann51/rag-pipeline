@@ -48,6 +48,18 @@ class DocumentStore:
         target_path.write_bytes(file_bytes)
         return document_id, target_path
 
+    def list_documents(self) -> list[DocumentRecord]:
+        if not self.documents_file.exists():
+            return []
+        records: list[DocumentRecord] = []
+        with self.documents_file.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                payload = line.strip()
+                if not payload:
+                    continue
+                records.append(DocumentRecord.model_validate(json.loads(payload)))
+        return records
+
     def append_document(self, record: DocumentRecord) -> None:
         payload = record.model_dump(mode="json")
         with self.documents_file.open("a", encoding="utf-8") as fh:

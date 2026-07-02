@@ -43,6 +43,11 @@
             <summary>Ingestion Result</summary>
             <pre id="ingestionResult" class="codebox">No uploads yet.</pre>
           </details>
+
+          <details id="fileListDetails" class="diag-box">
+            <summary>Loaded Files (<span id="fileCount">0</span>)</summary>
+            <ul id="fileList" class="file-list"></ul>
+          </details>
         </section>
 
         <section class="panel query-panel">
@@ -63,6 +68,7 @@
             <div id="answerCard" class="answer-card">
               <h3>Response</h3>
               <p id="answerText"></p>
+              <div id="disclaimerBanner" class="disclaimer-banner hidden"></div>
               <div id="citationSection" class="citation-section hidden">
                 <p class="citation-label">Citations</p>
                 <div id="citationChips" class="chips"></div>

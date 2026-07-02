@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     embedding_max_retries_on_rate_limit: int = 3
     embedding_retry_base_delay_seconds: float = 1.0
 
-    generation_enabled: bool = False
+    generation_enabled: bool = True
     mistral_chat_model: str = "mistral-small-latest"
     generation_temperature: float = 0.2
     generation_max_tokens: int = 600

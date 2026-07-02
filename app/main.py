@@ -429,6 +429,8 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
 
     generated_answer: str | None = None
     cited_chunk_ids: list[str] = []
+    hallucination_warning: bool = False
+    unsupported_sentences: list[str] = []
     if settings.generation_enabled:
         top_relevance_score = max(chunk.relevance_score for chunk in retrieved_chunks)
         avg_relevance_score = sum(chunk.relevance_score for chunk in retrieved_chunks) / len(retrieved_chunks)
@@ -453,6 +455,8 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             else:
                 generated_answer = generation_result.answer
                 cited_chunk_ids = generation_result.cited_chunk_ids
+                hallucination_warning = generation_result.hallucination_warning
+                unsupported_sentences = generation_result.unsupported_sentences
 
     return QueryResponse(
         original_query=original_query,
@@ -465,6 +469,8 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
         generated_answer=generated_answer,
         cited_chunk_ids=cited_chunk_ids,
         disclaimer=disclaimer,
+        hallucination_warning=hallucination_warning,
+        unsupported_sentences=unsupported_sentences,
     )
 
 
@@ -574,6 +580,11 @@ async def ingest_pdfs(files: list[UploadFile] = File(...)) -> IngestionResponse:
         failed=failed,
         total_chunks_written=total_chunks_written,
     )
+
+
+@app.get("/ingestion/documents", response_model=list[DocumentRecord])
+def list_documents() -> list[DocumentRecord]:
+    return store.list_documents()
 
 
 @app.delete("/ingestion/reset", response_model=ClearIngestionResponse)
