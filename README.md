@@ -15,7 +15,6 @@ Backend implementation for PDF ingestion and hybrid retrieval (keyword + semanti
 
 Out of scope:
 
-- Chat UI
 - Multi-turn chat memory/agentic workflows
 
 ## API Endpoints
@@ -25,6 +24,26 @@ Out of scope:
 - `DELETE /ingestion/reset`
 - `POST /query`
 - `POST /embeddings/warmup`
+
+UI:
+
+- `GET /ui` serves the browser interface for ingestion and querying.
+
+## UI (Current)
+
+The UI is intentionally response-first and lightweight:
+
+- Primary flow:
+  - Upload PDFs
+  - Ask a query
+  - Read the generated response
+- Secondary sections are collapsible to reduce noise:
+  - Ingestion result
+  - Diagnostics
+  - Retrieved chunks
+- Citations are displayed in a dedicated citations section under the response.
+- Inline citation tokens are removed from displayed answer prose to avoid duplication.
+- Clicking a citation chip scrolls to the corresponding retrieved chunk.
 
 ## Ingestion
 
@@ -192,6 +211,12 @@ uv sync --active
 uv run --active uvicorn app.main:app --reload
 ```
 
+4. Open UI:
+
+```text
+http://127.0.0.1:8000/ui
+```
+
 ## Quick Test Commands
 
 Ingest:
@@ -217,11 +242,11 @@ curl -X POST "http://127.0.0.1:8000/query" \
 
 curl -X POST "http://127.0.0.1:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"gradient descent","top_k":7}'
+  -d '{"query":"What does the document say about house stark?","top_k":7}'
 
 curl -X POST "http://127.0.0.1:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the document say about gradient descent?","top_k":7}'
+  -d '{"query":"What is reverse-mode automatic differentiation used for in the notes?","top_k":7}'
 ```
 
 Reset:
@@ -243,4 +268,7 @@ curl -X DELETE "http://127.0.0.1:8000/ingestion/reset"
 - Embedding store: `app/storage/embedding_store.py`
 - Schemas: `app/schemas.py`
 - Settings: `app/config.py`
+- UI markup: `ui/index.html`
+- UI behavior: `ui/app.js`
+- UI styles: `ui/styles.css`
 

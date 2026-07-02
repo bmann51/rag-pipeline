@@ -1,7 +1,9 @@
 from uuid import uuid4
 from collections import Counter
+from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.ingestion.pdf_ingestor import build_chunks, extract_pdf_pages
@@ -52,6 +54,8 @@ answer_generator = AnswerGenerator(
 )
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
+ui_dir = Path(__file__).resolve().parent.parent / "ui"
+app.mount("/ui", StaticFiles(directory=str(ui_dir), html=True), name="ui")
 
 
 def _normalize_scores(raw_scores: dict[str, float]) -> dict[str, float]:
