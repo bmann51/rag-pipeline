@@ -1,274 +1,318 @@
 # StackAI RAG Assessment
 
-Backend implementation for PDF ingestion and hybrid retrieval (keyword + semantic) for the StackAI FDE take-home assessment.
+A FastAPI backend implementing a Retrieval-Augmented Generation pipeline over PDF knowledge bases. Text is extracted from uploaded PDFs, split into overlapping chunks, embedded with Mistral, and stored locally. Queries are intent-gated, rewritten, retrieved via hybrid BM25 + semantic search, fused, and answered by a grounded LLM with per-claim citations.
 
-## Current Scope
+No external RAG library or vector database is used.
 
-- FastAPI backend only
-- PDF ingestion with dedupe and OCR fallback
-- Local JSONL storage (no vector database)
-- Intent-gated query processing
-- Hybrid retrieval: BM25-style keyword + embedding semantic search
-- Score fusion and conservative reranking tie-breaker
-- Embedding persistence and warmup endpoint
-- Optional grounded answer generation with Mistral
+---
 
-Out of scope:
+## System Architecture
 
-- Multi-turn chat memory/agentic workflows
+```mermaid
+flowchart TD
+    A["POST /query"] --> B["Normalize & clean"]
+    B --> C{"Policy gate"}
+    C -- "PII detected" --> D["Refuse: query_refused"]
+    C -- "OK" --> E{"Intent gate"}
+    E -- "chitchat / no intent" --> F["Return: search_not_required"]
+    E -- "retrieval intent" --> G["Rewrite: filler strip + acronym expansion"]
+    G --> H["Keyword search — BM25"]
+    G --> I["Semantic search — cosine sim"]
+    H --> J["Normalize + fuse scores"]
+    I --> J
+    J --> K["Source-consistency tie-breaker"]
+    K --> L{"Evidence gate"}
+    L -- "no evidence" --> M["Return: insufficient_evidence"]
+    L -- "evidence found" --> N["Rank top-k chunks"]
+    N --> O["Generate — intent-shaped prompt"]
+    O --> P["Return: retrieval_complete"]
+```
+
+---
+
+## Design Rationale
+
+### Chunking
+
+Text is chunked **per page**, never crossing page boundaries. Each page is split paragraph-by-paragraph, accumulating paragraphs into a buffer until the `chunk_size_chars` target (1,200 characters by default) would be exceeded. When that happens the current buffer is emitted as a chunk, and the next chunk starts with the last `chunk_overlap_chars` (180 characters, roughly 1–2 sentences) of the previous one. Long single paragraphs that exceed the target are force-split at the nearest sentence boundary.
+
+**Why paragraph-aware rather than fixed-width sliding windows?** Fixed-width windows break sentences mid-thought, which degrades both BM25 term matching (a key term may land at the edge of two windows) and embedding quality (the model encodes an incomplete semantic unit). Paragraph boundaries are natural topic breaks, so keeping them together improves coherence.
+
+**Why page-scoped?** Cross-page chunks conflate context from adjacent topics, which is common in academic PDFs where section headers fall near the bottom of one page. Page-scoping also makes citations precise: every chunk carries `page_start` / `page_end` metadata that maps directly back to the source document.
+
+**Trade-off:** Very short pages (captions, headers-only) may produce chunks below `min_chunk_chars` (250 characters) and are discarded. This means caption-only figures are not retrievable; a future improvement would be image OCR for figure captions.
+
+**OCR fallback:** If `pypdf` extracts no text (scanned PDFs), the file is uploaded to Mistral OCR (`mistral-ocr-latest`), which returns Markdown per page. The same chunker runs on the Markdown output. The uploaded file is always deleted from Mistral's servers after processing.
+
+---
+
+### Hybrid Retrieval and Score Fusion
+
+Both keyword and semantic retrievers run independently over the full chunk corpus and return scored candidate sets that may be disjoint.
+
+**BM25 keyword search** is implemented from scratch (no external library). It uses standard BM25+ IDF weighting with `k1=1.5`, `b=0.75`. The corpus index (tokenized chunks, per-doc term frequencies, document frequencies, average document length) is built once per corpus state and cached in memory; it is invalidated and rebuilt only when new documents are ingested or the corpus is reset.
+
+**Semantic search** embeds the query with `mistral-embed` and computes cosine similarity against stored chunk embeddings. Embeddings are persisted in a JSONL file and loaded into memory at query time; only missing embeddings are generated during a query, so repeated queries over the same corpus incur no redundant embedding API calls.
+
+**Why not Reciprocal Rank Fusion (RRF)?** RRF requires both retrievers to produce a ranked list over the same candidate pool. Here, each retriever searches independently and may surface different chunks. Linear fusion over normalized scores handles the union naturally: a chunk that appears in both ranked lists with high scores in each gets the full additive benefit; a chunk that only one retriever surfaces gets only that retriever's contribution.
+
+**Score normalization:** Raw BM25 and cosine similarity scores have different ranges and distributions. Min-max normalization maps each retriever's result set to [0, 1] before fusion, making the weight parameter meaningful.
+
+**Fusion weights:** 40% keyword, 60% semantic. Semantic search captures paraphrase and conceptual similarity; keyword search catches exact terminology and proper nouns that embedding models may not surface reliably. The 60/40 split favors semantic for general-purpose knowledge bases while preserving keyword precision for technical documents with domain-specific terms.
+
+**Source-consistency tie-breaker:** For short queries (≤ 4 terms), the fused ranking sometimes surfaces chunks from multiple documents at similar scores even when the user's intent clearly targets one document. A small additive bonus (`+0.05`) is applied to all top-8 chunks from the dominant source, provided that source holds at least 60% of the top window and the query is short enough that single-source intent is plausible. This is intentionally conservative and disabled for longer, multi-concept queries.
+
+**Evidence gating:** Before returning chunks to the caller, two thresholds are checked:
+- `relevance_threshold` (0.3): minimum fused score; prevents very weak matches from appearing in results.
+- `min_query_term_coverage` (0.5): at least half the query's meaningful tokens must appear in the chunk text; prevents semantically drifted embedding matches from passing as evidence.
+
+If no chunk passes both thresholds, the response status is `insufficient_evidence` and no answer is generated.
+
+---
 
 ## API Endpoints
 
-- `GET /health`
-- `POST /ingestion/pdfs`
-- `DELETE /ingestion/reset`
-- `POST /query`
-- `POST /embeddings/warmup`
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/ingestion/pdfs` | Ingest one or more PDF files |
+| `DELETE` | `/ingestion/reset` | Clear all ingested data and embeddings |
+| `POST` | `/query` | Query the knowledge base |
+| `POST` | `/embeddings/warmup` | Pre-generate embeddings for all chunks |
+| `GET` | `/ui` | Browser UI |
 
-UI:
+### POST /ingestion/pdfs
 
-- `GET /ui` serves the browser interface for ingestion and querying.
+Accepts `multipart/form-data` with one or more `files`.
 
-## UI (Current)
+- PDFs only; validated by extension and MIME content
+- Max file size enforced (`max_upload_size_mb`, default 25 MB)
+- SHA-256 deduplication: re-uploading an identical file is a no-op
+- Text extracted with `pypdf`; falls back to Mistral OCR for image-only PDFs
+- Chunks persisted to `data/records/chunks.jsonl`
+- Documents persisted to `data/records/documents.jsonl`
 
-The UI is intentionally response-first and lightweight:
+### POST /query
 
-- Primary flow:
-  - Upload PDFs
-  - Ask a query
-  - Read the generated response
-- Secondary sections are collapsible to reduce noise:
-  - Ingestion result
-  - Diagnostics
-  - Retrieved chunks
-- Citations are displayed in a dedicated citations section under the response.
-- Inline citation tokens are removed from displayed answer prose to avoid duplication.
-- Clicking a citation chip scrolls to the corresponding retrieved chunk.
+Request body:
 
-## Ingestion
-
-`POST /ingestion/pdfs`
-
-- Accepts `multipart/form-data` with one or more `files`
-- Accepts `.pdf` only
-- Validates max file size
-- Deduplicates by SHA-256
-- Extracts text with `pypdf`
-- Falls back to Mistral OCR when extraction is empty
-- Chunks text with overlap and page provenance
-- Persists:
-  - Uploaded files in `data/uploads/`
-  - Documents in `data/records/documents.jsonl`
-  - Chunks in `data/records/chunks.jsonl`
-
-`DELETE /ingestion/reset`
-
-- Clears uploads, documents, chunks, and cached embeddings
-
-## Retrieval Pipeline
-
-`POST /query`
-
-1. Normalize and classify intent.
-2. Skip retrieval for non-search conversational input.
-3. Rewrite query when useful (filler stripping, acronym expansion, topic extraction).
-4. Run keyword retrieval across query variants.
-5. Run semantic retrieval with cached chunk embeddings.
-6. Fuse normalized keyword and semantic scores.
-7. Apply conservative short-query source-consistency tie-breaker when conditions are met.
-8. Apply evidence gating:
-   - relevance threshold
-   - query-term coverage threshold
-9. Optionally generate a grounded answer with citations from retrieved chunks.
-
-Response statuses currently used:
-
-- `search_not_required`
-- `retrieval_complete`
-- `insufficient_evidence`
-
-Diagnostics include:
-
-- `intent`
-- `reason`
-- `rewrite_notes`
-- `topic_query`
-- `retrieval_queries`
-
-When generation is enabled and succeeds, query responses also include:
-
-- `generated_answer`
-- `cited_chunk_ids`
-
-## Embeddings and Rate Limits
-
-Semantic retrieval uses Mistral embeddings.
-
-Required:
-
-- `MISTRAL_API_KEY`
-
-Optional:
-
-- `MISTRAL_EMBEDDING_MODEL` (default `mistral-embed`)
-- `MISTRAL_CHAT_MODEL` (default `mistral-small-latest`)
-
-Persistence:
-
-- Chunk embeddings are stored in `data/records/chunk_embeddings.jsonl`
-- Missing chunk embeddings are generated and appended during query-time retrieval
-
-Warmup endpoint:
-
-- `POST /embeddings/warmup`
-- Optional query params:
-  - `force_rebuild=true`
-  - `max_chunks=<N>`
-
-Rate-limit resilience:
-
-- Request pacing (`embedding_min_request_interval_seconds`)
-- 429 retries with exponential backoff (`embedding_max_retries_on_rate_limit`, `embedding_retry_base_delay_seconds`)
-
-Generation behavior:
-
-- Disabled by default (`generation_enabled=false`).
-- Runs only for `retrieval_complete` responses.
-- Skips generation when retrieval confidence is too low.
-- Falls back to retrieval-only output if generation fails (non-fatal).
-
-## Validation Status (Current)
-
-What has been validated so far:
-
-- Retrieval pipeline is stable across intent-gated, in-domain, and out-of-domain queries.
-- Hybrid retrieval (keyword + semantic + fusion) is returning expected `status` values.
-- Embedding persistence and warmup are working (`chunk_embeddings.jsonl` reuse verified).
-- Optional generation path is active and returns grounded answers with chunk citations on many factual queries.
-- Citation IDs in responses are validated against retrieved chunk IDs.
-
-Known gaps observed:
-
-- Answer generation is not yet fully consistent on all answerable questions.
-- Some answerable prompts still return retrieval evidence but no generated answer when citation formatting from the model is weak.
-- For ambiguous short phrases, top-source selection can occasionally drift across documents depending on wording.
-
-## Remaining Testing (Next Round)
-
-When additional PDFs/domains are loaded, run these checks:
-
-1. Corpus coverage checks
-  - Build a small answer key per new document (10-20 factual questions with expected phrases).
-  - Measure: status accuracy, evidence hit rate, answer hit rate, citation validity.
-2. Cross-document ambiguity checks
-  - Test short overlapping terms that may appear in multiple documents.
-  - Confirm top results come from intended source when query context implies one document/domain.
-3. Citation robustness checks
-  - Verify generated answers contain valid `cited_chunk_ids` mapped to returned chunks.
-  - Track how often generation is skipped due to missing/invalid citations.
-4. Out-of-corpus safety checks
-  - Validate that unsupported questions continue to return `insufficient_evidence`.
-5. Scale/performance checks
-  - Re-run warmup + query batches after adding files to confirm no rate-limit regressions.
-  - Confirm generation remains non-fatal under transient model/API failures.
-
-Suggested acceptance bar for next pass:
-
-- `status` correctness: >= 95%
-- evidence contains expected facts (for answerable set): >= 90%
-- generated answer contains expected facts (for answerable set): >= 80%
-- citation validity (generated answers): 100%
-
-Reusable scorecard command:
-
-```bash
-/Users/brianmann/git/stackai/.venv/bin/python scripts/qa_scorecard.py
+```json
+{ "query": "string", "top_k": 5 }
 ```
 
-Optional:
+Response fields of note:
 
-- `--cases path/to/cases.json` to run a custom answer-key set
-- `--save reports/qa_scorecard.json` to save full results
+| Field | Description |
+|-------|-------------|
+| `status` | `search_not_required` / `query_refused` / `retrieval_complete` / `insufficient_evidence` |
+| `diagnostics.intent` | `retrieval_request` / `topic_query` / `no_retrieval_intent` |
+| `diagnostics.policy_flag` | `pii_detected` / `legal_topic` / `medical_topic` / `null` |
+| `diagnostics.answer_intent` | `factual` / `list` / `compare` / `summarize` |
+| `retrieved_chunks` | Ranked chunks with `relevance_score`, `keyword_score`, `semantic_score` |
+| `generated_answer` | LLM answer with inline citations (when generation is enabled) |
+| `cited_chunk_ids` | Chunk IDs referenced in the generated answer |
+| `disclaimer` | Legal or medical disclaimer when `policy_flag` is set |
 
-## Run Locally (uv)
+---
 
-1. Create and activate environment:
+## Retrieval Pipeline (Step by Step)
+
+1. **Normalize and clean** — collapse whitespace, strip punctuation artifacts.
+2. **Policy gate** — check for PII patterns (SSN, payment card numbers) and sensitive topics (legal advice, medical advice). PII triggers an immediate refusal; legal/medical topics allow retrieval to proceed but attach a disclaimer to the response.
+3. **Intent gate** — classify the query as `retrieval_request`, `topic_query`, or `no_retrieval_intent`. Chitchat and pure conversational input short-circuits here without hitting the retriever.
+4. **Rewrite** — strip conversational filler prefixes ("can you tell me about…"), expand acronyms found in the corpus.
+5. **Keyword retrieval** — BM25 search over all query variants (original and topic-extracted form).
+6. **Semantic retrieval** — embed the query with `mistral-embed`, compute cosine similarity against stored chunk embeddings. Missing embeddings are generated and cached.
+7. **Score fusion** — min-max normalize both score sets; compute weighted sum (40% keyword, 60% semantic).
+8. **Source-consistency bonus** — apply small tie-breaker for short queries over a consistent top window.
+9. **Evidence gate** — filter by relevance threshold and query-term coverage; return `insufficient_evidence` if nothing passes.
+10. **Answer generation** — call `mistral-small-latest` with an intent-shaped prompt; validate that the response contains citations mapping to retrieved chunk IDs.
+
+---
+
+## Query Refusal Policies
+
+Refusals and disclaimers are applied before retrieval runs.
+
+| Trigger | Behaviour |
+|---------|-----------|
+| SSN pattern (`\d{3}-\d{2}-\d{4}`) in query | Refuse: `status=query_refused`, no retrieval |
+| 16-digit payment card number in query | Refuse: `status=query_refused`, no retrieval |
+| Legal advice language ("can I sue", "am I liable", "legal advice", …) | Allow retrieval, attach legal disclaimer to response |
+| Medical advice language ("diagnose", "symptoms of", "should I take", …) | Allow retrieval, attach medical disclaimer to response |
+
+The `policy_flag` field in `diagnostics` records which rule fired.
+
+---
+
+## Answer Shaping by Intent
+
+The query processor classifies each retrieval-bound query into an answer intent, which selects a different system prompt for the LLM:
+
+| `answer_intent` | Trigger pattern | Prompt behaviour |
+|-----------------|-----------------|-----------------|
+| `list` | "list all…", "enumerate…", "what are all the…" | Numbered list; each item must cite its source chunk |
+| `compare` | "compare…", "difference between…", "versus" | Structured comparison; labelled paragraphs per subject |
+| `summarize` | "summarize…", "summary of…", "overview of…" | Short paragraphs or outline with headers |
+| `factual` | Everything else | Default inline-citation prose |
+
+The `answer_intent` value is included in the response diagnostics.
+
+---
+
+## Storage and Persistence
+
+All state is stored as newline-delimited JSON files under `data/`:
+
+| File | Contents |
+|------|----------|
+| `data/records/documents.jsonl` | One document record per ingested PDF |
+| `data/records/chunks.jsonl` | One chunk record per text slice |
+| `data/records/chunk_embeddings.jsonl` | `{chunk_id: [float, …]}` map, appended on demand |
+| `data/uploads/` | Original uploaded PDF files |
+
+---
+
+## Embeddings
+
+- Model: `mistral-embed` (configurable via `MISTRAL_EMBEDDING_MODEL`)
+- Embeddings are generated lazily during queries and cached to disk
+- `POST /embeddings/warmup` pre-generates all missing embeddings upfront (useful before a demo)
+- Rate-limit resilience: request pacing + exponential backoff on 429s
+
+---
+
+## Known Limitations and Future Work
+
+These are the main scalability and correctness boundaries of the current implementation.
+
+**Flat-file storage** — Documents, chunks, and embeddings are stored as JSONL files and read sequentially on every request. This works well up to ~10,000–20,000 chunks; beyond that, load time per query becomes the bottleneck. A production system would use a relational store for documents/chunks and a dedicated vector store for embeddings.
+
+**Brute-force cosine similarity** — Semantic search computes cosine similarity between the query vector and every stored embedding in memory. This is O(n) per query with no indexing. For large corpora, an Approximate Nearest Neighbour index (e.g., HNSW via FAISS or hnswlib) would reduce this to O(log n) at the cost of slight recall loss.
+
+**BM25 index is per-process and in-memory** — The cached BM25 index is local to a single uvicorn worker process. Under multi-worker deployments each worker maintains an independent cache, and invalidation signals from one worker do not propagate to others. This is correct for single-worker development use; a shared cache layer (Redis) or rebuilding from disk on each startup would be needed for multi-worker production.
+
+**Embedding store fully loaded on each query** — The entire `chunk_embeddings.jsonl` file is deserialised into a dict on each query call. For corpora with tens of thousands of chunks this becomes a noticeable overhead. A memory-mapped format or an in-process cache with a TTL would remove most of this cost.
+
+**No pagination on ingestion** — `POST /ingestion/pdfs` processes all uploaded files in a single request. Very large batches should be split by the caller.
+
+---
+
+## Libraries Used
+
+| Library | Purpose | Link |
+|---------|---------|------|
+| FastAPI | Web framework, request routing, OpenAPI docs | https://fastapi.tiangolo.com |
+| uvicorn | ASGI server | https://www.uvicorn.org |
+| Mistral AI Python SDK | Embeddings, chat completion, OCR | https://github.com/mistralai/client-python |
+| pypdf | PDF text extraction | https://github.com/py-pdf/pypdf |
+| pydantic-settings | Typed settings from environment / `.env` | https://docs.pydantic.dev/latest/concepts/pydantic_settings |
+| python-multipart | Multipart form parsing for file uploads (FastAPI dependency) | https://github.com/Kludex/python-multipart |
+| httpx | Async HTTP client (Mistral SDK dependency) | https://www.python-httpx.org |
+
+No external RAG framework or vector database is used.
+
+---
+
+## Run Locally
 
 ```bash
+# 1. Create environment
 uv venv .venv
 source .venv/bin/activate
-```
 
-2. Install dependencies:
-
-```bash
+# 2. Install dependencies
 uv sync --active
-```
 
-3. Start API:
+# 3. Set API key
+echo "MISTRAL_API_KEY=your_key_here" > .env
 
-```bash
+# 4. Start server
 uv run --active uvicorn app.main:app --reload
+
+# 5. Open UI
+open http://127.0.0.1:8000/ui
 ```
 
-4. Open UI:
+### Configuration
 
-```text
-http://127.0.0.1:8000/ui
+Key settings in `.env` (all optional, defaults shown):
+
+```env
+MISTRAL_API_KEY=
+MISTRAL_EMBEDDING_MODEL=mistral-embed
+MISTRAL_CHAT_MODEL=mistral-small-latest
+GENERATION_ENABLED=false
+CHUNK_SIZE_CHARS=1200
+CHUNK_OVERLAP_CHARS=180
+QUERY_TOP_K=5
+SEMANTIC_SEARCH_ENABLED=true
 ```
+
+---
 
 ## Quick Test Commands
 
-Ingest:
+**Ingest PDFs:**
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/ingestion/pdfs" \
-  -F "files=@/absolute/path/to/file1.pdf" \
-  -F "files=@/absolute/path/to/file2.pdf"
+  -F "files=@/path/to/file1.pdf" \
+  -F "files=@/path/to/file2.pdf"
 ```
 
-Warm embeddings:
+**Warm embeddings:**
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/embeddings/warmup"
 ```
 
-Query examples:
+**Query examples:**
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/query" \
+# Chitchat — no retrieval
+curl -s -X POST "http://127.0.0.1:8000/query" \
   -H "Content-Type: application/json" \
   -d '{"query":"hello"}'
 
-curl -X POST "http://127.0.0.1:8000/query" \
+# Factual question
+curl -s -X POST "http://127.0.0.1:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What does the document say about house stark?","top_k":7}'
+  -d '{"query":"What does the document say about transformer architectures?","top_k":5}'
 
-curl -X POST "http://127.0.0.1:8000/query" \
+# List intent — structured answer
+curl -s -X POST "http://127.0.0.1:8000/query" \
   -H "Content-Type: application/json" \
-  -d '{"query":"What is reverse-mode automatic differentiation used for in the notes?","top_k":7}'
+  -d '{"query":"List all the key contributions described in the paper"}'
+
+# PII refusal
+curl -s -X POST "http://127.0.0.1:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"My SSN is 123-45-6789, what does the document say about taxes?"}'
 ```
 
-Reset:
+**Reset:**
 
 ```bash
 curl -X DELETE "http://127.0.0.1:8000/ingestion/reset"
 ```
 
+---
+
 ## Key Files
 
-- API orchestration: `app/main.py`
-- Query processing: `app/retrieval/query_processor.py`
-- Keyword retrieval: `app/retrieval/keyword_search.py`
-- Semantic retrieval: `app/retrieval/semantic_search.py`
-- Embedding client: `app/retrieval/embeddings.py`
-- PDF ingestion: `app/ingestion/pdf_ingestor.py`
-- Chunking: `app/ingestion/chunker.py`
-- Document store: `app/storage/document_store.py`
-- Embedding store: `app/storage/embedding_store.py`
-- Schemas: `app/schemas.py`
-- Settings: `app/config.py`
-- UI markup: `ui/index.html`
-- UI behavior: `ui/app.js`
-- UI styles: `ui/styles.css`
-
+| File | Purpose |
+|------|---------|
+| `app/main.py` | FastAPI app, endpoint handlers, retrieval orchestration |
+| `app/retrieval/query_processor.py` | Intent classification, query rewriting, policy gating |
+| `app/retrieval/keyword_search.py` | BM25 implementation with in-memory index cache |
+| `app/retrieval/semantic_search.py` | Cosine similarity search over stored embeddings |
+| `app/retrieval/embeddings.py` | Mistral embedding client with rate-limit handling |
+| `app/retrieval/answer_generator.py` | Grounded answer generation with intent-shaped prompts |
+| `app/ingestion/pdf_ingestor.py` | PDF text extraction and OCR fallback |
+| `app/ingestion/chunker.py` | Paragraph-aware, page-scoped chunking |
+| `app/storage/document_store.py` | JSONL persistence for documents and chunks |
+| `app/storage/embedding_store.py` | JSONL persistence for chunk embeddings |
+| `app/schemas.py` | Pydantic request/response models |
+| `app/config.py` | Typed settings with environment variable overrides |
+| `ui/index.html` / `ui/app.js` / `ui/styles.css` | Browser UI |
