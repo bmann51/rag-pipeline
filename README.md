@@ -76,6 +76,7 @@ If no chunk passes both thresholds, the response status is `insufficient_evidenc
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check |
 | `POST` | `/ingestion/pdfs` | Ingest one or more PDF files |
+| `GET` | `/ingestion/documents` | List all ingested documents |
 | `DELETE` | `/ingestion/reset` | Clear all ingested data and embeddings |
 | `POST` | `/query` | Query the knowledge base |
 | `POST` | `/embeddings/warmup` | Pre-generate embeddings for all chunks |
@@ -104,7 +105,7 @@ Response fields of note:
 
 | Field | Description |
 |-------|-------------|
-| `status` | `search_not_required` / `query_refused` / `retrieval_complete` / `insufficient_evidence` |
+| `status` | `search_not_required` / `query_refused` / `ready_for_retrieval` / `retrieval_complete` / `insufficient_evidence` |
 | `diagnostics.intent` | `retrieval_request` / `topic_query` / `no_retrieval_intent` |
 | `diagnostics.policy_flag` | `pii_detected` / `legal_topic` / `medical_topic` / `null` |
 | `diagnostics.answer_intent` | `factual` / `list` / `compare` / `summarize` |
@@ -112,6 +113,8 @@ Response fields of note:
 | `generated_answer` | LLM answer with inline citations (when generation is enabled) |
 | `cited_chunk_ids` | Chunk IDs referenced in the generated answer |
 | `disclaimer` | Legal or medical disclaimer when `policy_flag` is set |
+| `hallucination_warning` | `true` if any sentence in the answer shares no vocabulary with the retrieved chunks |
+| `unsupported_sentences` | List of specific sentences that triggered `hallucination_warning` |
 
 ---
 
@@ -127,6 +130,7 @@ Response fields of note:
 8. **Source-consistency bonus** — apply small tie-breaker for short queries over a consistent top window.
 9. **Evidence gate** — filter by relevance threshold and query-term coverage; return `insufficient_evidence` if nothing passes.
 10. **Answer generation** — call `mistral-small-latest` with an intent-shaped prompt; validate that the response contains citations mapping to retrieved chunk IDs.
+11. **Hallucination check** — split the answer into sentences; flag any sentence that shares no vocabulary with the retrieved chunks (overlap threshold: 15%).
 
 ---
 
@@ -157,6 +161,16 @@ The query processor classifies each retrieval-bound query into an answer intent,
 | `factual` | Everything else | Default inline-citation prose |
 
 The `answer_intent` value is included in the response diagnostics.
+
+---
+
+## Hallucination Detection
+
+After a successful generation, each sentence in the answer is checked against the retrieved chunks. A sentence is flagged as unsupported if the overlap between its meaningful tokens and the tokens of every retrieved chunk falls below 15%.
+
+Short sentences (fewer than 5 meaningful tokens), hedge phrases ("I don't have enough evidence…"), and citation-only fragments are skipped. The check is post-hoc and non-blocking — the answer is still returned, but `hallucination_warning: true` and the specific `unsupported_sentences` are surfaced in the response so the caller can decide how to handle them.
+
+**Why 15% and not stricter?** A higher threshold produces false positives when the LLM paraphrases using synonyms not present verbatim in the chunks. The 15% floor targets only sentences that share *no* vocabulary with any chunk — genuine fabrication rather than valid reformulation.
 
 ---
 
@@ -242,7 +256,7 @@ Key settings in `.env` (all optional, defaults shown):
 MISTRAL_API_KEY=
 MISTRAL_EMBEDDING_MODEL=mistral-embed
 MISTRAL_CHAT_MODEL=mistral-small-latest
-GENERATION_ENABLED=false
+GENERATION_ENABLED=true
 CHUNK_SIZE_CHARS=1200
 CHUNK_OVERLAP_CHARS=180
 QUERY_TOP_K=5
