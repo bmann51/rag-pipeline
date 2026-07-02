@@ -21,6 +21,13 @@ _HEDGE_PHRASES = (
     "i do not have",
 )
 
+_TOPIC_CLASSIFY_PROMPT = (
+    "Classify the user query with exactly one word: \"legal\", \"medical\", or \"none\".\n"
+    "legal — seeks legal advice, mentions lawsuits, liability, attorneys, contracts, regulations.\n"
+    "medical — seeks medical advice, diagnosis, treatment, medications, symptoms, dosage.\n"
+    "none — anything else."
+)
+
 _CITE_RULE = (
     "Cite every factual claim inline using the chunk ID in square brackets, e.g. [chunk-id]. "
     "If the provided context is insufficient, say exactly: "
@@ -84,6 +91,31 @@ class AnswerGenerator:
         if self._client is None:
             self._client = Mistral(api_key=self.api_key)
         return self._client
+
+    async def classify_sensitive_topic_async(self, query: str) -> str | None:
+        """Returns 'legal_topic', 'medical_topic', or None. Never raises."""
+        if not self.api_key:
+            return None
+        try:
+            client = self._get_client()
+            response = await client.chat.complete_async(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": _TOPIC_CLASSIFY_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.0,
+                max_tokens=5,
+            )
+            content = self._extract_content(response).strip().lower()
+            word = content.split()[0] if content else ""
+            if word == "legal":
+                return "legal_topic"
+            if word == "medical":
+                return "medical_topic"
+        except Exception:
+            pass
+        return None
 
     async def generate_answer_async(
         self,

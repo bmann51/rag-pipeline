@@ -11,21 +11,23 @@ No external RAG library or vector database is used.
 ```mermaid
 flowchart TD
     A["POST /query"] --> B["Normalize & clean"]
-    B --> C{"Policy gate"}
-    C -- "PII detected" --> D["Refuse: query_refused"]
-    C -- "OK" --> E{"Intent gate"}
-    E -- "chitchat / no intent" --> F["Return: search_not_required"]
-    E -- "retrieval intent" --> G["Rewrite: filler strip + acronym expansion"]
-    G --> H["Keyword search — BM25"]
-    G --> I["Semantic search — cosine sim"]
-    H --> J["Normalize + fuse scores"]
-    I --> J
-    J --> K["Source-consistency tie-breaker"]
-    K --> L{"Evidence gate"}
-    L -- "no evidence" --> M["Return: insufficient_evidence"]
-    L -- "evidence found" --> N["Rank top-k chunks"]
-    N --> O["Generate — intent-shaped prompt"]
-    O --> P["Return: retrieval_complete"]
+    B --> C{"PII gate (SSN regex)"}
+    C -- "SSN detected" --> D["Refuse: query_refused"]
+    C -- "OK" --> E["create_task: LLM topic classify"]
+    E --> F{"Intent gate"}
+    F -- "chitchat / no intent" --> G["Cancel topic task\nReturn: search_not_required"]
+    F -- "retrieval intent" --> H["Rewrite: filler strip + acronym expansion"]
+    H --> I["Keyword search — BM25"]
+    H --> J["Semantic search — cosine sim"]
+    I --> K["Normalize + fuse scores"]
+    J --> K
+    K --> L["Source-consistency tie-breaker"]
+    L --> M["Await topic task result"]
+    M --> N{"Evidence gate"}
+    N -- "no evidence" --> O["Return: insufficient_evidence\n(+ disclaimer if topic flagged)"]
+    N -- "evidence found" --> P["Rank top-k chunks"]
+    P --> Q["Generate — intent-shaped prompt"]
+    Q --> R["Return: retrieval_complete\n(+ disclaimer if topic flagged)"]
 ```
 
 ---
@@ -48,25 +50,44 @@ All pages are concatenated into a single document string, with each page's chara
 
 ### Hybrid Retrieval and Score Fusion
 
-Both keyword and semantic retrievers run independently over the full chunk corpus and return scored candidate sets that may be disjoint.
+Both keyword and semantic retrievers run independently over the full chunk corpus and return scored candidate sets that may be disjoint — each retriever surfaces whatever it considers relevant, and the two result sets are merged rather than intersected.
 
-**BM25 keyword search** is implemented from scratch (no external library). It uses standard BM25+ IDF weighting with `k1=1.5`, `b=0.75`. The corpus index (tokenized chunks, per-doc term frequencies, document frequencies, average document length) is built once per corpus state and cached in memory; it is invalidated and rebuilt only when new documents are ingested or the corpus is reset.
+**Keyword search** is a from-scratch BM25 implementation (no external library), using the standard Robertson–Sparck Jones weighting with smoothed IDF (`k1=1.5`, `b=0.75` — the conventional Okapi BM25 defaults). Scoring requires three corpus-wide statistics: per-term document frequency, per-chunk length, and average chunk length. None of these depend on the query, so the index (tokenized chunks, term frequencies, document frequencies, average length) is built once and cached in memory, and only rebuilt when the corpus changes via ingestion or reset.
 
-**Semantic search** embeds the query with `mistral-embed` and computes cosine similarity against stored chunk embeddings. Embeddings are persisted in a JSONL file and loaded into memory at query time; only missing embeddings are generated during a query, so repeated queries over the same corpus incur no redundant embedding API calls.
+**Semantic search** embeds the query with `mistral-embed` and computes cosine similarity against stored chunk embeddings, which are persisted in a JSONL file and loaded into memory at query time. Only embeddings missing from the cache are generated on demand, so repeated queries over a stable corpus incur no redundant embedding API calls.
 
-**Why not Reciprocal Rank Fusion (RRF)?** RRF requires both retrievers to produce a ranked list over the same candidate pool. Here, each retriever searches independently and may surface different chunks. Linear fusion over normalized scores handles the union naturally: a chunk that appears in both ranked lists with high scores in each gets the full additive benefit; a chunk that only one retriever surfaces gets only that retriever's contribution.
+**Why linear fusion over normalized scores, rather than Reciprocal Rank Fusion (RRF)?** RRF combines two ranked lists by position alone — a chunk's contribution depends only on *where* it ranks in each list (`1 / (k + rank)`), not by how much better it scored than its neighbors. That discards information we wanted to keep: a chunk that BM25 scores dramatically higher than the runner-up is a stronger signal than one that barely edges it out, and RRF can't distinguish the two. Linear fusion over normalized scores preserves that margin. It also handles disjoint candidate sets naturally without needing a shared ranking: a chunk both retrievers surface with high scores gets the full additive benefit of both; a chunk only one retriever finds gets only that retriever's (normalized) contribution.
 
-**Score normalization:** Raw BM25 and cosine similarity scores have different ranges and distributions. Min-max normalization maps each retriever's result set to [0, 1] before fusion, making the weight parameter meaningful.
+**Score normalization:** raw BM25 scores and cosine similarities live on different, unrelated scales, so each retriever's result set is min-max normalized to `[0, 1]` before fusion — otherwise the fusion weights wouldn't mean what they're supposed to mean. This is a simple, interpretable normalization, but it is sensitive to outliers: a single unusually high BM25 score (e.g. a chunk that happens to repeat a rare query term many times) compresses every other score toward the low end. A percentile-based or z-score normalization would be more robust to that but adds complexity that didn't seem justified for this corpus size.
 
-**Fusion weights:** 40% keyword, 60% semantic. Semantic search captures paraphrase and conceptual similarity; keyword search catches exact terminology and proper nouns that embedding models may not surface reliably. The 60/40 split favors semantic for general-purpose knowledge bases while preserving keyword precision for technical documents with domain-specific terms.
+**Fusion weights: 40% keyword, 60% semantic.** Swept `α` (keyword weight) from 0.0 to 1.0 against `qa_scorecard.py`. Results were flat from `α=0.0` to `α=0.7` — the two retrievers overlap on ~28% of top candidates per query, so the split only matters at the margins. Past `α=0.8`, heavy keyword weighting cost a query that needed semantic matching. The current 0.4/0.6 split sits inside that flat region rather than at a uniquely optimal point — the sweep confirms it isn't worse than any alternative tried, not that it's the single best value.
 
-**Source-consistency tie-breaker:** For short queries (≤ 4 terms), the fused ranking sometimes surfaces chunks from multiple documents at similar scores even when the user's intent clearly targets one document. A small additive bonus (`+0.05`) is applied to all top-8 chunks from the dominant source, provided that source holds at least 60% of the top window and the query is short enough that single-source intent is plausible. This is intentionally conservative and disabled for longer, multi-concept queries.
+**Source-consistency tie-breaker:** for short queries (≤ 4 terms), the fused ranking can surface chunks from multiple documents at similar scores even when the query clearly targets one document. When one source holds at least 60% of the top-8 window, a small additive bonus (`+0.05`) is applied to that source's chunks within the window. This is deliberately small and narrowly scoped — a nudge, not a re-ranking override — because a more aggressive version risks reinforcing an accidentally dominant document (e.g. one with simply more or longer chunks) rather than correcting a genuinely ambiguous query. It's disabled entirely for longer, multi-concept queries where single-source intent is less plausible.
 
-**Evidence gating:** Before returning chunks to the caller, two thresholds are checked:
-- `relevance_threshold` (0.3): minimum fused score; prevents very weak matches from appearing in results.
-- `min_query_term_coverage` (0.5): at least half the query's meaningful tokens must appear in the chunk text; prevents semantically drifted embedding matches from passing as evidence.
+**Evidence gating:** before chunks are returned, two independent thresholds must both pass:
 
-If no chunk passes both thresholds, the response status is `insufficient_evidence` and no answer is generated.
+- `relevance_threshold` (0.3) — the minimum fused score, catching generally weak matches.
+- `min_query_term_coverage` (0.5) — at least half the query's meaningful tokens must literally appear in the chunk text.
+
+These catch different failure modes. Fused score alone can miss a specific weakness of semantic search: an embedding can rate two texts as highly similar in *meaning* while sharing almost no actual vocabulary, which the score threshold won't necessarily catch if both retrievers agree on a moderately high score for a topically-adjacent-but-wrong chunk. The coverage check is a cheap, literal sanity check layered on top of a different failure mode than the score threshold covers. If no chunk clears both, the response status is `insufficient_evidence` and no answer is generated.
+
+---
+
+### Intent Gating and Policy Filters
+
+The pipeline uses two different strategies depending on the nature of the check.
+
+**PII detection is rule-based (SSN regex only).** The check runs before any retrieval and triggers an immediate refusal. Using a rule here is the *more correct* choice, not just the cheaper one: sending potentially-sensitive query text to a third-party API in order to classify it as PII would defeat the purpose of the check. The pattern is tight (`\d{3}[-\s]\d{2}[-\s]\d{4}`) — it requires the canonical hyphen/space separators, so bare nine-digit strings are not caught.
+
+**Legal/medical topic flagging uses an async LLM call that runs concurrently with retrieval.** Rule-based patterns for this check had recall near zero in practice — queries like "what are the side effects of ibuprofen?" or "can my landlord do this?" don't contain the specific trigger phrases the regexes looked for, so the disclaimer was simply never attached even when it should have been. Semantic variation is too wide for a fixed keyword list to cover reliably. The LLM classifier handles paraphrase naturally with a three-word output space (`"legal"` / `"medical"` / `"none"`), which keeps the response easy to validate.
+
+The latency and cost concern that keeps the other gates rule-based is addressed by running this check concurrently: as soon as the PII gate passes, `asyncio.create_task` fires a `mistral-small-latest` request (`max_tokens=5`, `temperature=0`). Keyword search and semantic embedding run in parallel. The task result is awaited only after the fused ranking is complete, so it adds zero wall-clock latency on the critical path. The cost is one small-model API call per retrieval-bound query; queries that short-circuit at the intent gate cancel the task before it is awaited and incur no cost.
+
+If the API call fails for any reason, the exception is swallowed and no disclaimer is attached — a failed classification is treated as `"none"` rather than as a hard error.
+
+**Chit-chat detection, retrieval-intent classification, and answer-intent shaping remain rule-based.** These run on every query — including the trivial ones rejected in milliseconds — so per-query LLM inference cost and latency are not justified. They are also fully deterministic: a given query always produces the same `intent` and `answer_intent`, making them unit-testable and auditable.
+
+**Known limitation:** rule-based intent classification is brittle to unanticipated phrasings. The concrete failure mode is a conversational prefix on a substantive query — `"what's up with the housing market"` is caught by the chit-chat prefix match on `"what's up"` and incorrectly gated out. The `diagnostics.intent` and `diagnostics.policy_flag` fields in every response make misclassifications visible and traceable.
 
 ---
 
@@ -86,7 +107,7 @@ If no chunk passes both thresholds, the response status is `insufficient_evidenc
 
 Accepts `multipart/form-data` with one or more `files`.
 
-- PDFs only; validated by extension and MIME content
+- PDFs only; validated by file extension
 - Max file size enforced (`max_upload_size_mb`, default 25 MB)
 - SHA-256 deduplication: re-uploading an identical file is a no-op
 - Text extracted with `pypdf`; falls back to Mistral OCR for image-only PDFs
@@ -105,9 +126,9 @@ Response fields of note:
 
 | Field | Description |
 |-------|-------------|
-| `status` | `search_not_required` / `query_refused` / `ready_for_retrieval` / `retrieval_complete` / `insufficient_evidence` |
+| `status` | `search_not_required` / `query_refused` / `retrieval_complete` / `insufficient_evidence` |
 | `diagnostics.intent` | `retrieval_request` / `topic_query` / `no_retrieval_intent` |
-| `diagnostics.policy_flag` | `pii_detected` / `legal_topic` / `medical_topic` / `null` |
+| `diagnostics.policy_flag` | `pii_detected` (rule-based, pre-retrieval) / `legal_topic` / `medical_topic` (LLM, post-retrieval) / `null` |
 | `diagnostics.answer_intent` | `factual` / `list` / `compare` / `summarize` |
 | `retrieved_chunks` | Ranked chunks with `relevance_score`, `keyword_score`, `semantic_score` |
 | `generated_answer` | LLM answer with inline citations (when generation is enabled) |
@@ -121,31 +142,30 @@ Response fields of note:
 ## Retrieval Pipeline (Step by Step)
 
 1. **Normalize and clean** — collapse whitespace, strip punctuation artifacts.
-2. **Policy gate** — check for PII patterns (SSN, payment card numbers) and sensitive topics (legal advice, medical advice). PII triggers an immediate refusal; legal/medical topics allow retrieval to proceed but attach a disclaimer to the response.
-3. **Intent gate** — classify the query as `retrieval_request`, `topic_query`, or `no_retrieval_intent`. Chitchat and pure conversational input short-circuits here without hitting the retriever.
-4. **Rewrite** — strip conversational filler prefixes ("can you tell me about…"), expand acronyms found in the corpus.
-5. **Keyword retrieval** — BM25 search over all query variants (original and topic-extracted form).
-6. **Semantic retrieval** — embed the query with `mistral-embed`, compute cosine similarity against stored chunk embeddings. Missing embeddings are generated and cached.
-7. **Score fusion** — min-max normalize both score sets; compute weighted sum (40% keyword, 60% semantic).
-8. **Source-consistency bonus** — apply small tie-breaker for short queries over a consistent top window.
-9. **Evidence gate** — filter by relevance threshold and query-term coverage; return `insufficient_evidence` if nothing passes.
-10. **Answer generation** — call `mistral-small-latest` with an intent-shaped prompt; validate that the response contains citations mapping to retrieved chunk IDs.
-11. **Hallucination check** — split the answer into sentences; flag any sentence that shares no vocabulary with the retrieved chunks (overlap threshold: 15%).
+2. **PII gate** — check for SSN pattern (`\d{3}[-\s]\d{2}[-\s]\d{4}`). Match triggers immediate refusal (`query_refused`); no retrieval occurs.
+3. **Fire async topic classifier** — `asyncio.create_task` dispatches an LLM call to classify the query as `legal`, `medical`, or `none`. Runs concurrently with all retrieval steps below; adds no wall-clock latency.
+4. **Intent gate** — classify as `retrieval_request`, `topic_query`, or `no_retrieval_intent`. Chitchat short-circuits here; the topic task is cancelled and no disclaimer is attached.
+5. **Rewrite** — strip conversational filler prefixes ("can you tell me about…"), expand acronyms found in the corpus.
+6. **Keyword retrieval** — BM25 search over all query variants (original and topic-extracted form).
+7. **Semantic retrieval** — embed the query with `mistral-embed`, compute cosine similarity against stored chunk embeddings. Missing embeddings are generated and cached.
+8. **Score fusion** — min-max normalize both score sets; compute weighted sum (40% keyword, 60% semantic).
+9. **Source-consistency bonus** — apply small tie-breaker for short queries over a consistent top window.
+10. **Await topic classifier** — collect the LLM result; resolve disclaimer string if `legal_topic` or `medical_topic`.
+11. **Evidence gate** — filter by relevance threshold and query-term coverage; return `insufficient_evidence` (with disclaimer if set) if nothing passes.
+12. **Answer generation** — call `mistral-small-latest` with an intent-shaped prompt; validate that the response contains citations mapping to retrieved chunk IDs.
+13. **Hallucination check** — split the answer into sentences; flag any sentence that shares no vocabulary with the retrieved chunks (overlap threshold: 15%).
 
 ---
 
 ## Query Refusal Policies
 
-Refusals and disclaimers are applied before retrieval runs.
+| Trigger | When | Behaviour |
+|---------|------|-----------|
+| SSN pattern (`\d{3}[-\s]\d{2}[-\s]\d{4}`) | Before retrieval (rule-based) | Refuse: `status=query_refused`, no retrieval |
+| LLM classifies query as `legal` | After retrieval (async LLM) | Allow retrieval, attach legal disclaimer to response |
+| LLM classifies query as `medical` | After retrieval (async LLM) | Allow retrieval, attach medical disclaimer to response |
 
-| Trigger | Behaviour |
-|---------|-----------|
-| SSN pattern (`\d{3}-\d{2}-\d{4}`) in query | Refuse: `status=query_refused`, no retrieval |
-| 16-digit payment card number in query | Refuse: `status=query_refused`, no retrieval |
-| Legal advice language ("can I sue", "am I liable", "legal advice", …) | Allow retrieval, attach legal disclaimer to response |
-| Medical advice language ("diagnose", "symptoms of", "should I take", …) | Allow retrieval, attach medical disclaimer to response |
-
-The `policy_flag` field in `diagnostics` records which rule fired.
+The `policy_flag` field in `diagnostics` records which check fired (`pii_detected`, `legal_topic`, `medical_topic`, or `null`).
 
 ---
 
@@ -170,8 +190,7 @@ After a successful generation, each sentence in the answer is checked against th
 
 Short sentences (fewer than 5 meaningful tokens), hedge phrases ("I don't have enough evidence…"), and citation-only fragments are skipped. The check is post-hoc and non-blocking — the answer is still returned, but `hallucination_warning: true` and the specific `unsupported_sentences` are surfaced in the response so the caller can decide how to handle them.
 
-**Why 15% and not stricter?** A higher threshold produces false positives when the LLM paraphrases using synonyms not present verbatim in the chunks. The 15% floor targets only sentences that share *no* vocabulary with any chunk — genuine fabrication rather than valid reformulation.
-
+**Why 15% and not stricter?** A higher threshold risks false positives when the LLM paraphrases with synonyms not in the chunks. 15% is a reasonable estimate, not a value swept against the scorecard.
 ---
 
 ## Storage and Persistence
@@ -324,7 +343,7 @@ curl -X DELETE "http://127.0.0.1:8000/ingestion/reset"
 | `app/retrieval/embeddings.py` | Mistral embedding client with rate-limit handling |
 | `app/retrieval/answer_generator.py` | Grounded answer generation with intent-shaped prompts |
 | `app/ingestion/pdf_ingestor.py` | PDF text extraction and OCR fallback |
-| `app/ingestion/chunker.py` | Paragraph-aware, page-scoped chunking |
+| `app/ingestion/chunker.py` | Document-level, paragraph-aware chunking with page-offset attribution |
 | `app/storage/document_store.py` | JSONL persistence for documents and chunks |
 | `app/storage/embedding_store.py` | JSONL persistence for chunk embeddings |
 | `app/schemas.py` | Pydantic request/response models |

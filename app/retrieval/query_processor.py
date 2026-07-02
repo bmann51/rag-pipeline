@@ -164,21 +164,6 @@ TOPIC_QUERY_STOPWORDS = {
 }
 
 _PII_SSN = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
-_PII_CARD = re.compile(r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b")
-
-_LEGAL_TOPIC = re.compile(
-    r"\b(legal\s+advice|am\s+i\s+liable|can\s+i\s+sue|lawsuit|litigation|"
-    r"attorney|lawyer|is\s+it\s+illegal|is\s+it\s+legal|defamation|"
-    r"malpractice|breach\s+of\s+contract|legal\s+action|arbitration)\b",
-    re.IGNORECASE,
-)
-_MEDICAL_TOPIC = re.compile(
-    r"\b(medical\s+advice|diagnos[ei]s?|prescription|dosage|overdose|"
-    r"should\s+i\s+take|am\s+i\s+sick|do\s+i\s+have|symptoms?\s+of|"
-    r"cure\s+for|treatment\s+for|drug\s+interaction|side\s+effects?\s+of|"
-    r"what\s+medication|is\s+this\s+cancer|is\s+this\s+serious)\b",
-    re.IGNORECASE,
-)
 
 _ANSWER_LIST = re.compile(
     r"^(?:list|enumerate|name\s+all|what\s+are\s+all\s+(?:the\s+)?|"
@@ -494,12 +479,8 @@ class QueryProcessor:
 
     @staticmethod
     def _check_policy_flag(text: str) -> str | None:
-        if _PII_SSN.search(text) or _PII_CARD.search(text):
+        if _PII_SSN.search(text):
             return "pii_detected"
-        if _MEDICAL_TOPIC.search(text):
-            return "medical_topic"
-        if _LEGAL_TOPIC.search(text):
-            return "legal_topic"
         return None
 
     @staticmethod

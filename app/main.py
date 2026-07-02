@@ -1,3 +1,4 @@
+import asyncio
 from uuid import uuid4
 from collections import Counter
 from pathlib import Path
@@ -259,9 +260,15 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             total_chunks_searched=0,
         )
 
-    disclaimer: str | None = _DISCLAIMERS.get(policy_flag) if policy_flag else None
+    # Fire LLM topic classification concurrently with retrieval — runs in parallel
+    # with the semantic embedding call so it adds no wall-clock latency on the
+    # critical path. PII is still caught above by fast regex before this runs.
+    topic_task: asyncio.Task[str | None] = asyncio.create_task(
+        answer_generator.classify_sensitive_topic_async(original_query)
+    )
 
     if not processed.search_required:
+        topic_task.cancel()
         diagnostics = QueryDiagnostics(
             intent=processed.intent,
             search_required=False,
@@ -281,7 +288,6 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             diagnostics=diagnostics,
             retrieved_chunks=[],
             total_chunks_searched=0,
-            disclaimer=disclaimer,
         )
 
     diagnostics = QueryDiagnostics(
@@ -385,6 +391,11 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             thresholded_chunk_ids.append(chunk_id)
         if len(thresholded_chunk_ids) >= top_k:
             break
+
+    # Collect topic classification result — task has been running alongside retrieval
+    topic_flag = await topic_task
+    disclaimer: str | None = _DISCLAIMERS.get(topic_flag) if topic_flag else None
+    diagnostics.policy_flag = policy_flag or topic_flag
 
     if not thresholded_chunk_ids:
         diagnostics.reason = (
