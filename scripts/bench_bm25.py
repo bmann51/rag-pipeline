@@ -7,6 +7,10 @@ new "build once, serve from cache" behaviour at several corpus sizes.
 Run from the repo root:
     python scripts/bench_bm25.py
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import random
 import string
 import time
