@@ -5,7 +5,7 @@ from typing import Iterable
 
 from pypdf import PdfReader
 
-from app.ingestion.chunker import TextSlice, chunk_page_text
+from app.ingestion.chunker import TextSlice, chunk_document
 
 
 def _is_retryable_ocr_error(exc: Exception) -> bool:
@@ -142,16 +142,12 @@ def build_chunks(
     chunk_overlap_chars: int,
     min_chunk_chars: int,
 ) -> list[TextSlice]:
-    all_chunks: list[TextSlice] = []
-    for page in pages:
-        page_chunks = chunk_page_text(
-            page.text,
-            page.page_number,
-            chunk_size_chars=chunk_size_chars,
-            chunk_overlap_chars=chunk_overlap_chars,
-            min_chunk_chars=min_chunk_chars,
-        )
-        all_chunks.extend(page_chunks)
+    all_chunks = chunk_document(
+        list(pages),
+        chunk_size_chars=chunk_size_chars,
+        chunk_overlap_chars=chunk_overlap_chars,
+        min_chunk_chars=min_chunk_chars,
+    )
 
     if not all_chunks:
         raise ValueError("The PDF does not contain extractable text.")

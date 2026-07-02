@@ -34,13 +34,13 @@ flowchart TD
 
 ### Chunking
 
-Text is chunked **per page**, never crossing page boundaries. Each page is split paragraph-by-paragraph, accumulating paragraphs into a buffer until the `chunk_size_chars` target (1,200 characters by default) would be exceeded. When that happens the current buffer is emitted as a chunk, and the next chunk starts with the last `chunk_overlap_chars` (180 characters, roughly 1–2 sentences) of the previous one. Long single paragraphs that exceed the target are force-split at the nearest sentence boundary.
+All pages are concatenated into a single document string, with each page's character range recorded as a span. The paragraph-accumulation chunker then runs over the full document: it accumulates paragraphs into a buffer up to `chunk_size_chars` (1,200 characters), emits a chunk, and starts the next one with the last `chunk_overlap_chars` (180 characters, roughly 1–2 sentences) of the previous chunk. Long single paragraphs are force-split at the nearest sentence boundary. When a chunk is emitted, its character range is compared against the recorded page spans to assign `page_start` / `page_end` — most chunks map to a single page, chunks that naturally straddle a page boundary get an accurate two-page citation (e.g. `page_start=4, page_end=5`).
 
 **Why paragraph-aware rather than fixed-width sliding windows?** Fixed-width windows break sentences mid-thought, which degrades both BM25 term matching (a key term may land at the edge of two windows) and embedding quality (the model encodes an incomplete semantic unit). Paragraph boundaries are natural topic breaks, so keeping them together improves coherence.
 
-**Why page-scoped?** Cross-page chunks conflate context from adjacent topics, which is common in academic PDFs where section headers fall near the bottom of one page. Page-scoping also makes citations precise: every chunk carries `page_start` / `page_end` metadata that maps directly back to the source document.
+**Why document-level rather than page-scoped?** The old per-page approach truncated chunks at page boundaries even when a sentence or paragraph ran across the boundary, producing an artificially cut-off chunk from the bottom of one page and an orphaned fragment at the top of the next. Running over the full document lets the chunker respect paragraph boundaries wherever they actually fall; the page attribution is still precise because it is computed from recorded character offsets, not assumed from the chunking boundary.
 
-**Trade-off:** Very short pages (captions, headers-only) may produce chunks below `min_chunk_chars` (250 characters) and are discarded. This means caption-only figures are not retrievable; a future improvement would be image OCR for figure captions.
+**Trade-off:** Very short pages (captions, headers-only) may produce chunks below `min_chunk_chars` (250 characters) and are skipped. This means caption-only figures are not retrievable; a future improvement would be image OCR for figure captions.
 
 **OCR fallback:** If `pypdf` extracts no text (scanned PDFs), the file is uploaded to Mistral OCR (`mistral-ocr-latest`), which returns Markdown per page. The same chunker runs on the Markdown output. The uploaded file is always deleted from Mistral's servers after processing.
 
