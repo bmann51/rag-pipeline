@@ -81,6 +81,8 @@ class QueryDiagnostics(BaseModel):
     rewrite_notes: list[str] = Field(default_factory=list)
     topic_query: str | None = None
     retrieval_queries: list[str] = Field(default_factory=list)
+    policy_flag: str | None = None
+    answer_intent: str = "factual"
 
 
 class QueryResponse(BaseModel):
@@ -89,6 +91,7 @@ class QueryResponse(BaseModel):
     top_k: int
     status: Literal[
         "search_not_required",
+        "query_refused",
         "ready_for_retrieval",
         "retrieval_complete",
         "insufficient_evidence",
@@ -98,3 +101,4 @@ class QueryResponse(BaseModel):
     total_chunks_searched: int = 0
     generated_answer: str | None = None
     cited_chunk_ids: list[str] = Field(default_factory=list)
+    disclaimer: str | None = None

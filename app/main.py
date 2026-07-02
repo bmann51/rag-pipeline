@@ -223,6 +223,43 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
     topic_query = processed.topic_query
     retrieval_queries = processed.retrieval_queries or [processed_query]
     rewrite_applied = processed.rewrite_applied
+    policy_flag = processed.policy_flag
+    answer_intent = processed.answer_intent
+
+    _DISCLAIMERS = {
+        "legal_topic": (
+            "This response is for informational purposes only and does not constitute legal advice. "
+            "Consult a qualified attorney for guidance specific to your situation."
+        ),
+        "medical_topic": (
+            "This response is for informational purposes only and does not constitute medical advice. "
+            "Consult a qualified healthcare professional for guidance specific to your situation."
+        ),
+    }
+
+    if policy_flag == "pii_detected":
+        diagnostics = QueryDiagnostics(
+            intent=processed.intent,
+            search_required=False,
+            rewrite_applied=rewrite_applied,
+            reason="Query refused: possible personally identifiable information detected. Please rephrase without personal data.",
+            rewrite_notes=processed.rewrite_notes,
+            topic_query=topic_query,
+            retrieval_queries=[],
+            policy_flag=policy_flag,
+            answer_intent=answer_intent,
+        )
+        return QueryResponse(
+            original_query=original_query,
+            processed_query=processed_query,
+            top_k=request.top_k or settings.query_top_k,
+            status="query_refused",
+            diagnostics=diagnostics,
+            retrieved_chunks=[],
+            total_chunks_searched=0,
+        )
+
+    disclaimer: str | None = _DISCLAIMERS.get(policy_flag) if policy_flag else None
 
     if not processed.search_required:
         diagnostics = QueryDiagnostics(
@@ -233,6 +270,8 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             rewrite_notes=processed.rewrite_notes,
             topic_query=topic_query,
             retrieval_queries=retrieval_queries,
+            policy_flag=policy_flag,
+            answer_intent=answer_intent,
         )
         return QueryResponse(
             original_query=original_query,
@@ -242,6 +281,7 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             diagnostics=diagnostics,
             retrieved_chunks=[],
             total_chunks_searched=0,
+            disclaimer=disclaimer,
         )
 
     diagnostics = QueryDiagnostics(
@@ -252,6 +292,8 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
         rewrite_notes=processed.rewrite_notes,
         topic_query=topic_query,
         retrieval_queries=retrieval_queries,
+        policy_flag=policy_flag,
+        answer_intent=answer_intent,
     )
     top_k = request.top_k or settings.query_top_k
     candidate_k = max(top_k, settings.semantic_candidate_k)
@@ -357,6 +399,7 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             diagnostics=diagnostics,
             retrieved_chunks=[],
             total_chunks_searched=len(chunks),
+            disclaimer=disclaimer,
         )
 
     retrieved_chunks: list[RetrievedChunk] = []
@@ -401,6 +444,7 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             generation_result = await answer_generator.generate_answer_async(
                 query=original_query,
                 retrieved_chunks=retrieved_chunks,
+                answer_intent=answer_intent,
             )
             if generation_result.error:
                 diagnostics.rewrite_notes.append(
@@ -420,6 +464,7 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
         total_chunks_searched=len(chunks),
         generated_answer=generated_answer,
         cited_chunk_ids=cited_chunk_ids,
+        disclaimer=disclaimer,
     )
 
 

@@ -13,6 +13,34 @@ UUID_PATTERN = re.compile(
 )
 WORD_PATTERN = re.compile(r"[a-z0-9]{3,}", re.IGNORECASE)
 
+_CITE_RULE = (
+    "Cite every factual claim inline using the chunk ID in square brackets, e.g. [chunk-id]. "
+    "If the provided context is insufficient, say exactly: "
+    "'I don't have enough evidence in the provided documents to answer that.'"
+)
+
+SYSTEM_PROMPTS: dict[str, str] = {
+    "factual": (
+        f"You are a retrieval-grounded assistant. Answer only using the provided context. {_CITE_RULE}"
+    ),
+    "list": (
+        "You are a retrieval-grounded assistant. Answer only using the provided context. "
+        "Structure your entire answer as a numbered list. "
+        f"Each list item must cite its source chunk ID in square brackets. {_CITE_RULE}"
+    ),
+    "compare": (
+        "You are a retrieval-grounded assistant. Answer only using the provided context. "
+        "Compare the subjects directly using a structured format — clearly labelled paragraphs "
+        "or a side-by-side breakdown per subject. "
+        f"{_CITE_RULE}"
+    ),
+    "summarize": (
+        "You are a retrieval-grounded assistant. Answer only using the provided context. "
+        "Provide a structured summary using short paragraphs or a brief outline with headers. "
+        f"{_CITE_RULE}"
+    ),
+}
+
 
 @dataclass
 class AnswerGenerationResult:
@@ -47,22 +75,22 @@ class AnswerGenerator:
             self._client = Mistral(api_key=self.api_key)
         return self._client
 
-    async def generate_answer_async(self, *, query: str, retrieved_chunks: list[RetrievedChunk]) -> AnswerGenerationResult:
+    async def generate_answer_async(
+        self,
+        *,
+        query: str,
+        retrieved_chunks: list[RetrievedChunk],
+        answer_intent: str = "factual",
+    ) -> AnswerGenerationResult:
         if not retrieved_chunks:
             return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="No chunks available.")
 
         limited_chunks = retrieved_chunks[: self.max_chunks]
         valid_chunk_ids = {chunk.chunk_id for chunk in limited_chunks}
         context = self._build_context(limited_chunks)
+        system_prompt = SYSTEM_PROMPTS.get(answer_intent, SYSTEM_PROMPTS["factual"])
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a retrieval-grounded assistant. Answer only using the provided context. "
-                    "If evidence is insufficient, say: 'I don't have enough evidence in the provided documents to answer that.' "
-                    "Cite factual statements inline using chunk IDs in square brackets, e.g. [chunk-id]."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": f"Question: {query}\n\nContext:\n{context}\n\nAnswer with citations.",
@@ -90,22 +118,22 @@ class AnswerGenerator:
 
         return AnswerGenerationResult(answer=content.strip(), cited_chunk_ids=cited_chunk_ids, error=None)
 
-    def generate_answer(self, *, query: str, retrieved_chunks: list[RetrievedChunk]) -> AnswerGenerationResult:
+    def generate_answer(
+        self,
+        *,
+        query: str,
+        retrieved_chunks: list[RetrievedChunk],
+        answer_intent: str = "factual",
+    ) -> AnswerGenerationResult:
         if not retrieved_chunks:
             return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="No chunks available.")
 
         limited_chunks = retrieved_chunks[: self.max_chunks]
         valid_chunk_ids = {chunk.chunk_id for chunk in limited_chunks}
         context = self._build_context(limited_chunks)
+        system_prompt = SYSTEM_PROMPTS.get(answer_intent, SYSTEM_PROMPTS["factual"])
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a retrieval-grounded assistant. Answer only using the provided context. "
-                    "If evidence is insufficient, say: 'I don't have enough evidence in the provided documents to answer that.' "
-                    "Cite factual statements inline using chunk IDs in square brackets, e.g. [chunk-id]."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": f"Question: {query}\n\nContext:\n{context}\n\nAnswer with citations.",

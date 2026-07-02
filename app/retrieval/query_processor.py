@@ -163,6 +163,39 @@ TOPIC_QUERY_STOPWORDS = {
     "with",
 }
 
+_PII_SSN = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+_PII_CARD = re.compile(r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b")
+
+_LEGAL_TOPIC = re.compile(
+    r"\b(legal\s+advice|am\s+i\s+liable|can\s+i\s+sue|lawsuit|litigation|"
+    r"attorney|lawyer|is\s+it\s+illegal|is\s+it\s+legal|defamation|"
+    r"malpractice|breach\s+of\s+contract|legal\s+action|arbitration)\b",
+    re.IGNORECASE,
+)
+_MEDICAL_TOPIC = re.compile(
+    r"\b(medical\s+advice|diagnos[ei]s?|prescription|dosage|overdose|"
+    r"should\s+i\s+take|am\s+i\s+sick|do\s+i\s+have|symptoms?\s+of|"
+    r"cure\s+for|treatment\s+for|drug\s+interaction|side\s+effects?\s+of|"
+    r"what\s+medication|is\s+this\s+cancer|is\s+this\s+serious)\b",
+    re.IGNORECASE,
+)
+
+_ANSWER_LIST = re.compile(
+    r"^(?:list|enumerate|name\s+all|what\s+are\s+all\s+(?:the\s+)?|"
+    r"give\s+me\s+(?:a\s+)?list|show\s+all|list\s+all|what\s+are\s+the\s+(?:main\s+)?)\b",
+    re.IGNORECASE,
+)
+_ANSWER_COMPARE = re.compile(
+    r"^(?:compare|difference\s+between|contrast|how\s+does\s+.+\s+differ|"
+    r"\bvs\b|\bversus\b)",
+    re.IGNORECASE,
+)
+_ANSWER_SUMMARIZE = re.compile(
+    r"^(?:summarize|summary\s+of|give\s+(?:me\s+)?(?:a\s+)?summary|"
+    r"overview\s+of|provide\s+(?:a\s+)?summary|what\s+is\s+the\s+summary)\b",
+    re.IGNORECASE,
+)
+
 ACRONYM_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]{1,9})\b")
 LONG_PHRASE_TO_ACRONYM = re.compile(
     r"\b([A-Za-z][A-Za-z0-9\-\s]{2,80}?)\s*\(([A-Z][A-Z0-9]{1,9})\)",
@@ -204,6 +237,8 @@ class QueryProcessingResult:
     search_required: bool
     reason: str | None = None
     rewrite_notes: list[str] = field(default_factory=list)
+    policy_flag: str | None = None
+    answer_intent: str = "factual"
 
 
 class QueryProcessor:
@@ -457,6 +492,26 @@ class QueryProcessor:
         expanded_query = self._normalize_whitespace(expanded_query)
         return expanded_query, unique_expansions
 
+    @staticmethod
+    def _check_policy_flag(text: str) -> str | None:
+        if _PII_SSN.search(text) or _PII_CARD.search(text):
+            return "pii_detected"
+        if _MEDICAL_TOPIC.search(text):
+            return "medical_topic"
+        if _LEGAL_TOPIC.search(text):
+            return "legal_topic"
+        return None
+
+    @staticmethod
+    def _classify_answer_intent(text: str) -> str:
+        if _ANSWER_LIST.match(text):
+            return "list"
+        if _ANSWER_COMPARE.match(text):
+            return "compare"
+        if _ANSWER_SUMMARIZE.match(text):
+            return "summarize"
+        return "factual"
+
     def process_query(
         self,
         query: str,
@@ -500,6 +555,7 @@ class QueryProcessor:
             processed = self._normalize_whitespace(processed)
 
         rewrite_applied = processed != normalized
+        policy_flag = self._check_policy_flag(normalized)
 
         intent, search_required, reason = self._classify_intent(
             normalized_query=normalized,
@@ -511,6 +567,7 @@ class QueryProcessor:
         )
         retrieval_queries = self._build_retrieval_queries(processed, topic_query)
         rewrite_notes.extend(topic_notes)
+        answer_intent = self._classify_answer_intent(processed) if search_required else "factual"
 
         if intent_gate_enabled and not search_required:
             return QueryProcessingResult(
@@ -524,6 +581,8 @@ class QueryProcessor:
                 search_required=False,
                 reason=reason,
                 rewrite_notes=rewrite_notes,
+                policy_flag=policy_flag,
+                answer_intent=answer_intent,
             )
 
         return QueryProcessingResult(
@@ -537,4 +596,6 @@ class QueryProcessor:
             search_required=True,
             reason=reason,
             rewrite_notes=rewrite_notes,
+            policy_flag=policy_flag,
+            answer_intent=answer_intent,
         )
