@@ -47,6 +47,49 @@ class AnswerGenerator:
             self._client = Mistral(api_key=self.api_key)
         return self._client
 
+    async def generate_answer_async(self, *, query: str, retrieved_chunks: list[RetrievedChunk]) -> AnswerGenerationResult:
+        if not retrieved_chunks:
+            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="No chunks available.")
+
+        limited_chunks = retrieved_chunks[: self.max_chunks]
+        valid_chunk_ids = {chunk.chunk_id for chunk in limited_chunks}
+        context = self._build_context(limited_chunks)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a retrieval-grounded assistant. Answer only using the provided context. "
+                    "If evidence is insufficient, say: 'I don't have enough evidence in the provided documents to answer that.' "
+                    "Cite factual statements inline using chunk IDs in square brackets, e.g. [chunk-id]."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Question: {query}\n\nContext:\n{context}\n\nAnswer with citations.",
+            },
+        ]
+
+        try:
+            content = await self._chat_complete_async(messages)
+        except Exception as exc:
+            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error=str(exc))
+
+        if not content:
+            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="Empty generation output.")
+
+        cited_chunk_ids = self._extract_citations(content, valid_chunk_ids)
+        if not cited_chunk_ids:
+            cited_chunk_ids = self._infer_citations_from_answer(content, limited_chunks)
+
+        if not cited_chunk_ids:
+            return AnswerGenerationResult(
+                answer=None,
+                cited_chunk_ids=[],
+                error="Generated answer did not contain valid citations.",
+            )
+
+        return AnswerGenerationResult(answer=content.strip(), cited_chunk_ids=cited_chunk_ids, error=None)
+
     def generate_answer(self, *, query: str, retrieved_chunks: list[RetrievedChunk]) -> AnswerGenerationResult:
         if not retrieved_chunks:
             return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="No chunks available.")
@@ -167,6 +210,26 @@ class AnswerGenerator:
         else:
             raise ValueError("Mistral chat completion method not found.")
 
+        return self._extract_content(response)
+
+    async def _chat_complete_async(self, messages: list[dict[str, str]]) -> str:
+        client = self._get_client()
+        chat_api = getattr(client, "chat", None)
+        if chat_api is None:
+            raise ValueError("Mistral chat API is unavailable in this client version.")
+
+        if not hasattr(chat_api, "complete_async"):
+            raise ValueError("Mistral async chat completion not available in this SDK version.")
+
+        response = await chat_api.complete_async(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        return self._extract_content(response)
+
+    def _extract_content(self, response) -> str:
         choices = getattr(response, "choices", None)
         if not choices:
             return ""

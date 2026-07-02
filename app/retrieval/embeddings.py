@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 import time
 
@@ -52,6 +53,54 @@ class EmbeddingClient:
     def embed_text(self, text: str) -> list[float]:
         vectors = self.embed_texts([text])
         return vectors[0]
+
+    async def embed_texts_async(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        client = self._get_client()
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            response = await self._request_embeddings_async(client, batch)
+            vectors.extend(item.embedding for item in response.data)
+
+        if len(vectors) != len(texts):
+            raise ValueError("Embedding response size mismatch.")
+
+        return vectors
+
+    async def embed_text_async(self, text: str) -> list[float]:
+        vectors = await self.embed_texts_async([text])
+        return vectors[0]
+
+    async def _request_embeddings_async(self, client: Mistral, batch: list[str]):
+        attempt = 0
+        while True:
+            await self._wait_for_rate_window_async()
+            try:
+                response = await client.embeddings.create_async(model=self.model, inputs=batch)
+                self._last_request_time = time.monotonic()
+                return response
+            except Exception as exc:
+                if not self._is_rate_limit_error(exc) or attempt >= self.max_retries_on_rate_limit:
+                    raise
+                delay = (self.retry_base_delay_seconds * (2**attempt)) + random.uniform(0.0, 0.25)
+                await asyncio.sleep(delay)
+                attempt += 1
+
+    async def _wait_for_rate_window_async(self) -> None:
+        if self.min_request_interval_seconds <= 0:
+            return
+
+        now = time.monotonic()
+        if self._last_request_time is None:
+            return
+
+        elapsed = now - self._last_request_time
+        remaining = self.min_request_interval_seconds - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
     def _request_embeddings(self, client: Mistral, batch: list[str]):
         attempt = 0

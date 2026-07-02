@@ -195,7 +195,7 @@ def warmup_embeddings(force_rebuild: bool = False, max_chunks: int | None = None
 
 
 @app.post("/query", response_model=QueryResponse)
-def query_documents(request: QueryRequest) -> QueryResponse:
+async def query_documents(request: QueryRequest) -> QueryResponse:
     original_query = request.query
     chunks = chunk_reader.load_chunks()
     processed = query_processor.process_query(
@@ -275,7 +275,7 @@ def query_documents(request: QueryRequest) -> QueryResponse:
             semantic_queries.append(topic_query)
         try:
             for semantic_query in semantic_queries:
-                query_hits, generated_embeddings = semantic_searcher.search(
+                query_hits, generated_embeddings = await semantic_searcher.search_async(
                     semantic_query,
                     chunks,
                     top_k=candidate_k,
@@ -398,7 +398,7 @@ def query_documents(request: QueryRequest) -> QueryResponse:
                 "Skipped answer generation due to low retrieval confidence."
             )
         else:
-            generation_result = answer_generator.generate_answer(
+            generation_result = await answer_generator.generate_answer_async(
                 query=original_query,
                 retrieved_chunks=retrieved_chunks,
             )
@@ -506,6 +506,7 @@ async def ingest_pdfs(files: list[UploadFile] = File(...)) -> IngestionResponse:
 
             store.append_document(document_record)
             store.append_chunks(chunk_records)
+            keyword_searcher.invalidate_cache()
 
             ingested.append(
                 FileIngestionResult(
@@ -534,6 +535,7 @@ async def ingest_pdfs(files: list[UploadFile] = File(...)) -> IngestionResponse:
 def clear_ingestion() -> ClearIngestionResponse:
     deleted_upload_entries, cleared_documents, cleared_chunks = store.clear_ingested_data()
     embedding_store.embeddings_file.write_text("", encoding="utf-8")
+    keyword_searcher.invalidate_cache()
     return ClearIngestionResponse(
         deleted_upload_entries=deleted_upload_entries,
         cleared_documents=cleared_documents,
