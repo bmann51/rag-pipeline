@@ -569,6 +569,7 @@ async def ingest_pdfs(files: list[UploadFile] = File(...)) -> IngestionResponse:
             store.append_document(document_record)
             store.append_chunks(chunk_records)
             keyword_searcher.invalidate_cache()
+            chunk_reader.invalidate_cache()
 
             ingested.append(
                 FileIngestionResult(
@@ -603,6 +604,7 @@ def clear_ingestion() -> ClearIngestionResponse:
     deleted_upload_entries, cleared_documents, cleared_chunks = store.clear_ingested_data()
     embedding_store.embeddings_file.write_text("", encoding="utf-8")
     keyword_searcher.invalidate_cache()
+    chunk_reader.invalidate_cache()
     return ClearIngestionResponse(
         deleted_upload_entries=deleted_upload_entries,
         cleared_documents=cleared_documents,

@@ -219,7 +219,7 @@ All state is stored as newline-delimited JSON files under `data/`:
 
 These are the main scalability and correctness boundaries of the current implementation.
 
-**Flat-file storage** — Documents, chunks, and embeddings are stored as JSONL files and read sequentially on every request. This works well up to ~10,000–20,000 chunks; beyond that, load time per query becomes the bottleneck. A production system would use a relational store for documents/chunks and a dedicated vector store for embeddings.
+**Flat-file storage** — Documents, chunks, and embeddings are stored as JSONL files. The chunk list is parsed once and cached in memory after the first query, then invalidated on ingest or reset — so repeated queries over a stable corpus pay no disk I/O for chunk loading. Embeddings are still read from disk on every query (see below). Beyond ~10,000–20,000 chunks the remaining per-query overhead becomes the bottleneck; a production system would use a relational store for documents/chunks and a dedicated vector store for embeddings.
 
 **Brute-force cosine similarity** — Semantic search computes cosine similarity between the query vector and every stored embedding in memory. This is O(n) per query with no indexing. For large corpora, an Approximate Nearest Neighbour index (e.g., HNSW via FAISS or hnswlib) would reduce this to O(log n) at the cost of slight recall loss.
 
