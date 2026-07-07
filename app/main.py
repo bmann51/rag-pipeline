@@ -10,7 +10,7 @@ from app.config import get_settings
 from app.ingestion.pdf_ingestor import build_chunks, extract_pdf_pages
 from app.retrieval.embeddings import EmbeddingClient
 from app.retrieval.keyword_search import KeywordSearcher
-from app.retrieval.query_processor import QueryProcessor
+from app.retrieval.query_processor import QueryProcessor, CHITCHAT_QUERIES
 from app.retrieval.semantic_search import SemanticSearcher
 from app.retrieval.answer_generator import AnswerGenerator
 from app.schemas import (
@@ -208,6 +208,31 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
 
     normalized_query = processed.normalized_query
 
+    # Exact chitchat matches ("hi", "yo", etc.) must be exempted before the length
+    # gate so they return search_not_required rather than a 400 error.
+    # Use processed_query (punctuation already stripped) lowercased so "Hi", "hi!",
+    # and "Hello" all match the same as "hello".
+    if processed.processed_query.lower() in CHITCHAT_QUERIES:
+        return QueryResponse(
+            original_query=original_query,
+            processed_query=normalized_query,
+            top_k=request.top_k or settings.query_top_k,
+            status="search_not_required",
+            diagnostics=QueryDiagnostics(
+                intent=processed.intent,
+                search_required=False,
+                rewrite_applied=False,
+                reason=processed.reason,
+                rewrite_notes=[],
+                topic_query=None,
+                retrieval_queries=[],
+                policy_flag=None,
+                answer_intent="factual",
+            ),
+            retrieved_chunks=[],
+            total_chunks_searched=0,
+        )
+
     if len(normalized_query) < settings.query_min_chars:
         raise HTTPException(
             status_code=400,
@@ -260,17 +285,34 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             total_chunks_searched=0,
         )
 
-    # Fire LLM topic classification concurrently with retrieval — runs in parallel
-    # with the semantic embedding call so it adds no wall-clock latency on the
-    # critical path. PII is still caught above by fast regex before this runs.
+    # Fire all three LLM tasks immediately after PII gate — run concurrently with each other.
+    # Intent and rewrite results are awaited before retrieval; topic result after.
+    intent_task: asyncio.Task[bool | None] = asyncio.create_task(
+        answer_generator.classify_search_intent_async(original_query)
+    )
+    rewrite_task: asyncio.Task[str | None] = asyncio.create_task(
+        answer_generator.rewrite_query_async(original_query)
+    )
     topic_task: asyncio.Task[str | None] = asyncio.create_task(
         answer_generator.classify_sensitive_topic_async(original_query)
     )
 
-    if not processed.search_required:
+    # LLM intent gate — fall back to rule-based result if the call fails
+    llm_search_required = await intent_task
+    search_required = (
+        processed.search_required if llm_search_required is None else llm_search_required
+    )
+    intent = (
+        processed.intent
+        if llm_search_required is None
+        else ("llm_retrieval_intent" if llm_search_required else "llm_no_retrieval_intent")
+    )
+
+    if not search_required:
+        rewrite_task.cancel()
         topic_task.cancel()
         diagnostics = QueryDiagnostics(
-            intent=processed.intent,
+            intent=intent,
             search_required=False,
             rewrite_applied=rewrite_applied,
             reason=processed.reason,
@@ -290,8 +332,15 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             total_chunks_searched=0,
         )
 
+    # Collect LLM rewrite; fall back to rule-based processed_query if it failed
+    llm_rewrite = await rewrite_task
+    if llm_rewrite:
+        processed_query = llm_rewrite
+        retrieval_queries = [processed_query]
+        rewrite_applied = True
+
     diagnostics = QueryDiagnostics(
-        intent=processed.intent,
+        intent=intent,
         search_required=True,
         rewrite_applied=rewrite_applied,
         reason=processed.reason,

@@ -13,10 +13,10 @@ flowchart TD
     A["POST /query"] --> B["Normalize & clean"]
     B --> C{"PII gate (SSN regex)"}
     C -- "SSN detected" --> D["Refuse: query_refused"]
-    C -- "OK" --> E["create_task: LLM topic classify"]
-    E --> F{"Intent gate"}
-    F -- "chitchat / no intent" --> G["Cancel topic task\nReturn: search_not_required"]
-    F -- "retrieval intent" --> H["Rewrite: filler strip + acronym expansion"]
+    C -- "OK" --> E["create_task: LLM intent classify\ncreate_task: LLM rewrite query\ncreate_task: LLM topic classify"]
+    E --> F["Await intent task result"]
+    F -- "none / no search" --> G["Cancel rewrite + topic tasks\nReturn: search_not_required"]
+    F -- "search" --> H["Await rewrite task result\n(fallback: rule-based rewrite)"]
     H --> I["Keyword search — BM25"]
     H --> J["Semantic search — cosine sim"]
     I --> K["Normalize + fuse scores"]
@@ -79,15 +79,17 @@ The pipeline uses two different strategies depending on the nature of the check.
 
 **PII detection is rule-based (SSN regex only).** The check runs before any retrieval and triggers an immediate refusal. Using a rule here is the *more correct* choice, not just the cheaper one: sending potentially-sensitive query text to a third-party API in order to classify it as PII would defeat the purpose of the check. The pattern is tight (`\d{3}[-\s]\d{2}[-\s]\d{4}`) — it requires the canonical hyphen/space separators, so bare nine-digit strings are not caught.
 
-**Legal/medical topic flagging uses an async LLM call that runs concurrently with retrieval.** Rule-based patterns for this check had recall near zero in practice — queries like "what are the side effects of ibuprofen?" or "can my landlord do this?" don't contain the specific trigger phrases the regexes looked for, so the disclaimer was simply never attached even when it should have been. Semantic variation is too wide for a fixed keyword list to cover reliably. The LLM classifier handles paraphrase naturally with a three-word output space (`"legal"` / `"medical"` / `"none"`), which keeps the response easy to validate.
+As soon as the PII gate passes, three `asyncio.create_task` calls fire concurrently:
 
-The latency and cost concern that keeps the other gates rule-based is addressed by running this check concurrently: as soon as the PII gate passes, `asyncio.create_task` fires a `mistral-small-latest` request (`max_tokens=5`, `temperature=0`). Keyword search and semantic embedding run in parallel. The task result is awaited only after the fused ranking is complete, so it adds zero wall-clock latency on the critical path. The cost is one small-model API call per retrieval-bound query; queries that short-circuit at the intent gate cancel the task before it is awaited and incur no cost.
+**1. Intent classification** (`"search"` / `"none"`, `max_tokens=5`, `temperature=0`) — awaited before the retrieval decision. Handles phrasings that rule-based prefix matching misclassifies, e.g. `"what's up with the housing market"`. Exact `CHITCHAT_QUERIES` matches ("hello", "hi") short-circuit before the LLM is consulted. Falls back to rule-based `QueryProcessor` result if the call fails; `diagnostics.intent` records which path was taken (`llm_retrieval_intent`, `llm_no_retrieval_intent`, or the rule-based values). If intent is `"none"`, the rewrite and topic tasks are cancelled immediately.
 
-If the API call fails for any reason, the exception is swallowed and no disclaimer is attached — a failed classification is treated as `"none"` rather than as a hard error.
+**2. Query rewrite** (`max_tokens=80`, `temperature=0`) — awaited after intent clears. The model strips conversational filler and rephrases the query as a concise, keyword-rich search string while preserving technical terms and acronyms. Falls back to the rule-based rewrite (filler-prefix stripping + corpus acronym expansion) if the call fails.
 
-**Chit-chat detection, retrieval-intent classification, and answer-intent shaping remain rule-based.** These run on every query — including the trivial ones rejected in milliseconds — so per-query LLM inference cost and latency are not justified. They are also fully deterministic: a given query always produces the same `intent` and `answer_intent`, making them unit-testable and auditable.
+**3. Legal/medical topic classification** (`"legal"` / `"medical"` / `"none"`, `max_tokens=5`, `temperature=0`) — awaited after retrieval completes, so it adds zero wall-clock latency on the critical path. Rule-based patterns for this check had recall near zero — queries like "what are the side effects of ibuprofen?" don't contain the specific trigger phrases a regex would need, so the disclaimer was never attached when it should have been. Failed calls are treated as `"none"` and no disclaimer is attached.
 
-**Known limitation:** rule-based intent classification is brittle to unanticipated phrasings. The concrete failure mode is a conversational prefix on a substantive query — `"what's up with the housing market"` is caught by the chit-chat prefix match on `"what's up"` and incorrectly gated out. The `diagnostics.intent` and `diagnostics.policy_flag` fields in every response make misclassifications visible and traceable.
+**Cost:** three `mistral-small-latest` calls per retrieval-bound query. Queries that short-circuit at the intent gate pay only the intent call (rewrite and topic tasks are cancelled). The PII gate itself is free — SSN check is a local regex.
+
+**Answer-intent shaping remains rule-based** (`list` / `compare` / `summarize` / `factual`) — the trigger patterns are unambiguous regex anchors on the first word(s) of the query, so LLM overhead is not justified.
 
 ---
 
@@ -127,7 +129,7 @@ Response fields of note:
 | Field | Description |
 |-------|-------------|
 | `status` | `search_not_required` / `query_refused` / `retrieval_complete` / `insufficient_evidence` |
-| `diagnostics.intent` | `retrieval_request` / `topic_query` / `no_retrieval_intent` |
+| `diagnostics.intent` | `llm_retrieval_intent` / `llm_no_retrieval_intent` (LLM path) or `retrieval_request` / `topic_query` / `no_retrieval_intent` (rule-based fallback) |
 | `diagnostics.policy_flag` | `pii_detected` (rule-based, pre-retrieval) / `legal_topic` / `medical_topic` (LLM, post-retrieval) / `null` |
 | `diagnostics.answer_intent` | `factual` / `list` / `compare` / `summarize` |
 | `retrieved_chunks` | Ranked chunks with `relevance_score`, `keyword_score`, `semantic_score` |
@@ -143,9 +145,9 @@ Response fields of note:
 
 1. **Normalize and clean** — collapse whitespace, strip punctuation artifacts.
 2. **PII gate** — check for SSN pattern (`\d{3}[-\s]\d{2}[-\s]\d{4}`). Match triggers immediate refusal (`query_refused`); no retrieval occurs.
-3. **Fire async topic classifier** — `asyncio.create_task` dispatches an LLM call to classify the query as `legal`, `medical`, or `none`. Runs concurrently with all retrieval steps below; adds no wall-clock latency.
-4. **Intent gate** — classify as `retrieval_request`, `topic_query`, or `no_retrieval_intent`. Chitchat short-circuits here; the topic task is cancelled and no disclaimer is attached.
-5. **Rewrite** — strip conversational filler prefixes ("can you tell me about…"), expand acronyms found in the corpus.
+3. **Fire async LLM tasks** — `asyncio.create_task` dispatches three concurrent LLM calls: intent classification (`"search"` / `"none"`), query rewrite, and sensitive topic classification (`"legal"` / `"medical"` / `"none"`). All three run in parallel.
+4. **Await intent result** — if `"none"`, cancel rewrite and topic tasks and return `search_not_required`. Falls back to rule-based classification if the LLM call failed.
+5. **Await rewrite result** — use LLM-rewritten query as the retrieval query; falls back to rule-based rewrite (filler strip + acronym expansion) if the call failed.
 6. **Keyword retrieval** — BM25 search over all query variants (original and topic-extracted form).
 7. **Semantic retrieval** — embed the query with `mistral-embed`, compute cosine similarity against stored chunk embeddings. Missing embeddings are generated and cached.
 8. **Score fusion** — min-max normalize both score sets; compute weighted sum (30% keyword, 70% semantic).
@@ -228,6 +230,28 @@ These are the main scalability and correctness boundaries of the current impleme
 **Embedding store fully loaded on each query** — The entire `chunk_embeddings.jsonl` file is deserialised into a dict on each query call. For corpora with tens of thousands of chunks this becomes a noticeable overhead. A memory-mapped format or an in-process cache with a TTL would remove most of this cost.
 
 **No pagination on ingestion** — `POST /ingestion/pdfs` processes all uploaded files in a single request. Very large batches should be split by the caller.
+
+---
+
+## Security
+
+### What is validated on upload
+
+- **Extension check** — only `.pdf` files are accepted, validated by filename suffix before any processing begins.
+- **Size cap** — files exceeding `max_upload_size_mb` (default 25 MB) are rejected before the bytes are read into the pipeline.
+- **Path traversal prevention** — the stored filename is derived via `Path(original_filename).name`, stripping any directory components a client might embed in the `Content-Disposition` header (e.g. `../../etc/passwd.pdf`).
+- **SHA-256 deduplication** — re-uploading an identical file is a no-op; the hash is computed before any disk write.
+- **pypdf parse as the real content gate** — the extension check is a fast first filter, not a security boundary. The real gate is `pypdf` attempting to parse the uploaded bytes; a file that isn't a valid PDF will fail extraction and be returned as a `failed` ingestion result rather than stored.
+
+### PII detection is intentionally local
+
+SSN pattern matching runs as a local regex before the query reaches any external API. Sending the raw query to a third-party service to *classify whether it contains PII* would expose that data in transit — the check would undermine itself. This is why PII detection is the one gate that stays rule-based even though the other gates moved to LLM classification.
+
+### Honest gaps
+
+- **No authentication** — all endpoints are unauthenticated. `DELETE /ingestion/reset` will wipe the entire corpus for any caller with network access to the server. In production this endpoint would require admin credentials at minimum.
+- **No rate limiting** — the query endpoint makes up to three upstream LLM API calls per request; a burst of concurrent requests could exhaust the Mistral rate limit or run up unexpected API cost.
+- **Extension-only MIME check** — a renamed non-PDF (e.g. a `.pdf`-suffixed HTML file) passes the extension filter. `pypdf` will reject it at parse time, but the bytes are read into memory first.
 
 ---
 

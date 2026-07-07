@@ -21,6 +21,21 @@ _HEDGE_PHRASES = (
     "i do not have",
 )
 
+_INTENT_CLASSIFY_PROMPT = (
+    "Reply with exactly one word.\n"
+    "Reply 'search' if the message is a question or request that needs information lookup.\n"
+    "Reply 'none' if it is a greeting, chit-chat, or social message needing no lookup.\n"
+    "Examples of 'none': hello, hi, how are you, thanks, what's up.\n"
+    "Examples of 'search': what is X, explain Y, how does Z work, tell me about W."
+)
+
+_REWRITE_PROMPT = (
+    "Rewrite the user query as a concise search query optimised for document retrieval.\n"
+    "Remove greetings, filler phrases, and conversational language.\n"
+    "Preserve all technical terms, named entities, and acronyms exactly.\n"
+    "Return only the rewritten query — no explanation, no trailing punctuation."
+)
+
 _TOPIC_CLASSIFY_PROMPT = (
     "Classify the user query with exactly one word: \"legal\", \"medical\", or \"none\".\n"
     "legal — seeks legal advice, mentions lawsuits, liability, attorneys, contracts, regulations.\n"
@@ -91,6 +106,53 @@ class AnswerGenerator:
         if self._client is None:
             self._client = Mistral(api_key=self.api_key)
         return self._client
+
+    async def rewrite_query_async(self, query: str) -> str | None:
+        """Returns rewritten query string, or None on failure (caller uses rule-based fallback)."""
+        if not self.api_key:
+            return None
+        try:
+            client = self._get_client()
+            response = await client.chat.complete_async(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": _REWRITE_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.0,
+                max_tokens=80,
+            )
+            rewritten = self._extract_content(response).strip()
+            if rewritten:
+                return rewritten
+        except Exception:
+            pass
+        return None
+
+    async def classify_search_intent_async(self, query: str) -> bool | None:
+        """True=search needed, False=no search, None=failed (caller uses rule-based fallback)."""
+        if not self.api_key:
+            return None
+        try:
+            client = self._get_client()
+            response = await client.chat.complete_async(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": _INTENT_CLASSIFY_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.0,
+                max_tokens=5,
+            )
+            content = self._extract_content(response).strip().lower()
+            word = content.split()[0] if content else ""
+            if word == "search":
+                return True
+            if word == "none":
+                return False
+        except Exception:
+            pass
+        return None
 
     async def classify_sensitive_topic_async(self, query: str) -> str | None:
         """Returns 'legal_topic', 'medical_topic', or None. Never raises."""
