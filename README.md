@@ -60,7 +60,7 @@ Both keyword and semantic retrievers run independently over the full chunk corpu
 
 **Score normalization:** raw BM25 scores and cosine similarities live on different, unrelated scales, so each retriever's result set is min-max normalized to `[0, 1]` before fusion — otherwise the fusion weights wouldn't mean what they're supposed to mean. This is a simple, interpretable normalization, but it is sensitive to outliers: a single unusually high BM25 score (e.g. a chunk that happens to repeat a rare query term many times) compresses every other score toward the low end. A percentile-based or z-score normalization would be more robust to that but adds complexity that didn't seem justified for this corpus size.
 
-**Fusion weights: 40% keyword, 60% semantic.** Swept `α` (keyword weight) from 0.0 to 1.0 against `qa_scorecard.py`. Results were flat from `α=0.0` to `α=0.7` — the two retrievers overlap on ~28% of top candidates per query, so the split only matters at the margins. Past `α=0.8`, heavy keyword weighting cost a query that needed semantic matching. The current 0.4/0.6 split sits inside that flat region rather than at a uniquely optimal point — the sweep confirms it isn't worse than any alternative tried, not that it's the single best value.
+**Fusion weights: 30% keyword, 70% semantic.** Swept `α` (keyword weight) from 0.0 to 1.0 against `qa_scorecard.py`. Results were flat from `α=0.0` to `α=0.7` — the two retrievers overlap on ~28% of top candidates per query, so the split only matters at the margins. Past `α=0.8`, heavy keyword weighting cost a query that needed semantic matching. The current 0.3/0.7 split sits inside that flat region rather than at a uniquely optimal point — the sweep confirms it isn't worse than any alternative tried, not that it's the single best value.
 
 **Source-consistency tie-breaker:** for short queries (≤ 4 terms), the fused ranking can surface chunks from multiple documents at similar scores even when the query clearly targets one document. When one source holds at least 60% of the top-8 window, a small additive bonus (`+0.05`) is applied to that source's chunks within the window. This is deliberately small and narrowly scoped — a nudge, not a re-ranking override — because a more aggressive version risks reinforcing an accidentally dominant document (e.g. one with simply more or longer chunks) rather than correcting a genuinely ambiguous query. It's disabled entirely for longer, multi-concept queries where single-source intent is less plausible.
 
@@ -148,7 +148,7 @@ Response fields of note:
 5. **Rewrite** — strip conversational filler prefixes ("can you tell me about…"), expand acronyms found in the corpus.
 6. **Keyword retrieval** — BM25 search over all query variants (original and topic-extracted form).
 7. **Semantic retrieval** — embed the query with `mistral-embed`, compute cosine similarity against stored chunk embeddings. Missing embeddings are generated and cached.
-8. **Score fusion** — min-max normalize both score sets; compute weighted sum (40% keyword, 60% semantic).
+8. **Score fusion** — min-max normalize both score sets; compute weighted sum (30% keyword, 70% semantic).
 9. **Source-consistency bonus** — apply small tie-breaker for short queries over a consistent top window.
 10. **Await topic classifier** — collect the LLM result; resolve disclaimer string if `legal_topic` or `medical_topic`.
 11. **Evidence gate** — filter by relevance threshold and query-term coverage; return `insufficient_evidence` (with disclaimer if set) if nothing passes.

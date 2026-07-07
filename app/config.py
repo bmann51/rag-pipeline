@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     query_max_chars: int = 500
     intent_gate_enabled: bool = True
     query_rewrite_enabled: bool = True
-    keyword_weight: float = 0.4
-    semantic_weight: float = 0.6
+    keyword_weight: float = 0.3
+    semantic_weight: float = 0.7
     relevance_threshold: float = 0.3
     min_query_term_coverage: float = 0.5
     semantic_search_enabled: bool = True
