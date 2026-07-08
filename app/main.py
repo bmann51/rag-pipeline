@@ -502,21 +502,28 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             diagnostics.rewrite_notes.append(
                 "Skipped answer generation due to low retrieval confidence."
             )
+            generated_answer = (
+                "I found some potentially related material, but not enough that I'm "
+                "confident answering from it. Try rephrasing the question or narrowing it."
+            )
         else:
             generation_result = await answer_generator.generate_answer_async(
                 query=original_query,
                 retrieved_chunks=retrieved_chunks,
                 answer_intent=answer_intent,
             )
+            # generation_result.answer is never blank by this point — even hard
+            # failures resolve to a fixed message inside the generator — so it is
+            # always safe to surface. `error` is retained as diagnostic context,
+            # not as a signal to withhold the answer.
+            generated_answer = generation_result.answer
+            cited_chunk_ids = generation_result.cited_chunk_ids
+            hallucination_warning = generation_result.hallucination_warning
+            unsupported_sentences = generation_result.unsupported_sentences
             if generation_result.error:
                 diagnostics.rewrite_notes.append(
-                    f"Answer generation unavailable: {generation_result.error}"
+                    f"Answer generation note: {generation_result.error}"
                 )
-            else:
-                generated_answer = generation_result.answer
-                cited_chunk_ids = generation_result.cited_chunk_ids
-                hallucination_warning = generation_result.hallucination_warning
-                unsupported_sentences = generation_result.unsupported_sentences
 
     return QueryResponse(
         original_query=original_query,

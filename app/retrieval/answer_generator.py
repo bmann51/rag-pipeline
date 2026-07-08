@@ -187,7 +187,9 @@ class AnswerGenerator:
         answer_intent: str = "factual",
     ) -> AnswerGenerationResult:
         if not retrieved_chunks:
-            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="No chunks available.")
+            return AnswerGenerationResult(
+                answer=self._NO_EVIDENCE_MESSAGE, cited_chunk_ids=[], error="No chunks available."
+            )
 
         limited_chunks = retrieved_chunks[: self.max_chunks]
         valid_chunk_ids = {chunk.chunk_id for chunk in limited_chunks}
@@ -204,30 +206,13 @@ class AnswerGenerator:
         try:
             content = await self._chat_complete_async(messages)
         except Exception as exc:
-            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error=str(exc))
-
-        if not content:
-            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="Empty generation output.")
-
-        cited_chunk_ids = self._extract_citations(content, valid_chunk_ids)
-        if not cited_chunk_ids:
-            cited_chunk_ids = self._infer_citations_from_answer(content, limited_chunks)
-
-        if not cited_chunk_ids:
             return AnswerGenerationResult(
-                answer=None,
+                answer=self._GENERATION_FAILURE_MESSAGE,
                 cited_chunk_ids=[],
-                error="Generated answer did not contain valid citations.",
+                error=str(exc),
             )
 
-        unsupported, warning = self._check_sentence_support(content.strip(), limited_chunks)
-        return AnswerGenerationResult(
-            answer=content.strip(),
-            cited_chunk_ids=cited_chunk_ids,
-            error=None,
-            unsupported_sentences=unsupported,
-            hallucination_warning=warning,
-        )
+        return self._finalize_generation(content, limited_chunks, valid_chunk_ids)
 
     def generate_answer(
         self,
@@ -237,7 +222,9 @@ class AnswerGenerator:
         answer_intent: str = "factual",
     ) -> AnswerGenerationResult:
         if not retrieved_chunks:
-            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="No chunks available.")
+            return AnswerGenerationResult(
+                answer=self._NO_EVIDENCE_MESSAGE, cited_chunk_ids=[], error="No chunks available."
+            )
 
         limited_chunks = retrieved_chunks[: self.max_chunks]
         valid_chunk_ids = {chunk.chunk_id for chunk in limited_chunks}
@@ -254,25 +241,70 @@ class AnswerGenerator:
         try:
             content = self._chat_complete(messages)
         except Exception as exc:
-            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error=str(exc))
+            return AnswerGenerationResult(
+                answer=self._GENERATION_FAILURE_MESSAGE,
+                cited_chunk_ids=[],
+                error=str(exc),
+            )
 
-        if not content:
-            return AnswerGenerationResult(answer=None, cited_chunk_ids=[], error="Empty generation output.")
+        return self._finalize_generation(content, limited_chunks, valid_chunk_ids)
+
+    _NO_EVIDENCE_MESSAGE = "I don't have enough evidence in the provided documents to answer that."
+    _GENERATION_FAILURE_MESSAGE = (
+        "I found potentially relevant material, but was unable to generate an answer "
+        "from it just now. Please try rephrasing the question or asking again."
+    )
+
+    def _finalize_generation(
+        self,
+        content: str,
+        limited_chunks: list[RetrievedChunk],
+        valid_chunk_ids: set[str],
+    ) -> AnswerGenerationResult:
+        """Turns raw model output into a result that is never blank.
+
+        Three outcomes, in priority order:
+        1. The model produced a valid hedge ("I don't have enough evidence...") —
+           surfaced as the answer directly; no citations expected or required.
+        2. The model produced content with recognizable chunk-id citations —
+           surfaced as the answer, citations attached, hallucination-checked.
+        3. The model produced content but didn't cite it in a recognizable
+           format — surfaced as the answer anyway (discarding it would silently
+           throw away a real response), flagged as uncited so the caller can
+           treat it with appropriately reduced trust.
+        Empty output from the model is the only case that falls back to a
+        fixed message, since there is nothing else to show.
+        """
+        if not content or not content.strip():
+            return AnswerGenerationResult(
+                answer=self._GENERATION_FAILURE_MESSAGE,
+                cited_chunk_ids=[],
+                error="Empty generation output.",
+            )
+
+        content = content.strip()
+        lowered = content.lower()
+        if any(hedge in lowered for hedge in _HEDGE_PHRASES):
+            return AnswerGenerationResult(answer=content, cited_chunk_ids=[], error=None)
 
         cited_chunk_ids = self._extract_citations(content, valid_chunk_ids)
         if not cited_chunk_ids:
             cited_chunk_ids = self._infer_citations_from_answer(content, limited_chunks)
 
         if not cited_chunk_ids:
+            # Real content, just not citeable in a format we recognize — show it
+            # rather than discard it, but flag it so the caller/UI can warn the
+            # user this answer isn't traceable to a specific source chunk.
             return AnswerGenerationResult(
-                answer=None,
+                answer=content,
                 cited_chunk_ids=[],
-                error="Generated answer did not contain valid citations.",
+                error="uncited",
+                hallucination_warning=True,
             )
 
-        unsupported, warning = self._check_sentence_support(content.strip(), limited_chunks)
+        unsupported, warning = self._check_sentence_support(content, limited_chunks)
         return AnswerGenerationResult(
-            answer=content.strip(),
+            answer=content,
             cited_chunk_ids=cited_chunk_ids,
             error=None,
             unsupported_sentences=unsupported,
@@ -337,7 +369,7 @@ class AnswerGenerator:
         chunks: list[RetrievedChunk],
     ) -> list[str]:
         answer_terms = set(term.lower() for term in WORD_PATTERN.findall(answer))
-        if len(answer_terms) < 6:
+        if len(answer_terms) < 3:
             return []
 
         best_chunk_id: str | None = None
