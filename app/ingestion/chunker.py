@@ -23,7 +23,7 @@ class _PageSpan:
 
 
 def _normalize_whitespace(text: str) -> str:
-    text = text.replace(" ", " ")
+    text = text.replace(" ", " ")
     text = re.sub(r"[\t\r\f]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ ]{2,}", " ", text)
@@ -111,6 +111,31 @@ def chunk_document(
         ps, pe = _resolve_pages(doc_start, doc_end, spans)
         chunks.append(TextSlice(text=text, page_start=ps, page_end=pe))
 
+    def split_and_emit_oversized(
+        text: str, doc_start: int, doc_end: int
+    ) -> tuple[str, int, int]:
+        """Emit sentence-boundary segments of `text` until the remainder fits
+        within chunk_size_chars. Returns the (remainder, doc_start, doc_end)
+        to carry forward as the new buffer.
+
+        Every emitted segment is capped at chunk_size_chars, so no chunk can
+        exceed the configured size regardless of how large the input paragraph
+        was (PDFs with sparse blank lines can extract as a single 100k+ char
+        "paragraph").
+        """
+        while len(text) > chunk_size_chars:
+            cut = _sentence_break_index(text, chunk_size_chars)
+            segment = text[:cut].strip()
+            # Approximate the doc-end for this segment proportionally.
+            ratio = cut / max(len(text), 1)
+            seg_doc_end = doc_start + int((doc_end - doc_start) * ratio)
+            if segment:
+                emit(segment, doc_start, seg_doc_end)
+            overlap = segment[-chunk_overlap_chars:] if (chunk_overlap_chars > 0 and segment) else ""
+            doc_start = max(doc_start, seg_doc_end - chunk_overlap_chars)
+            text = f"{overlap} {text[cut:]}".strip() if overlap else text[cut:].strip()
+        return text, doc_start, doc_end
+
     for para_text, para_start, para_end in paras:
         candidate = f"{buffer}\n\n{para_text}".strip() if buffer else para_text
 
@@ -128,25 +153,19 @@ def chunk_document(
             buffer = f"{overlap} {para_text}".strip() if overlap else para_text
             buf_doc_start = overlap_doc_start if overlap else para_start
             buf_doc_end = para_end
+            # The incoming paragraph may itself exceed chunk_size_chars; without
+            # this, it would be carried forward unsplit and emitted as a single
+            # oversized chunk.
+            if len(buffer) > chunk_size_chars:
+                buffer, buf_doc_start, buf_doc_end = split_and_emit_oversized(
+                    buffer, buf_doc_start, buf_doc_end
+                )
         else:
             # Long paragraph (or tiny buffer + large para) that overflows on its own.
-            long_text = candidate
             long_doc_start = buf_doc_start if buffer else para_start
-            long_doc_end = para_end
-            while len(long_text) > chunk_size_chars:
-                cut = _sentence_break_index(long_text, chunk_size_chars)
-                segment = long_text[:cut].strip()
-                # Approximate the doc-end for this segment proportionally.
-                ratio = cut / max(len(long_text), 1)
-                seg_doc_end = long_doc_start + int((long_doc_end - long_doc_start) * ratio)
-                if segment:
-                    emit(segment, long_doc_start, seg_doc_end)
-                overlap = segment[-chunk_overlap_chars:] if (chunk_overlap_chars > 0 and segment) else ""
-                long_doc_start = max(long_doc_start, seg_doc_end - chunk_overlap_chars)
-                long_text = f"{overlap} {long_text[cut:]}".strip() if overlap else long_text[cut:].strip()
-            buffer = long_text
-            buf_doc_start = long_doc_start
-            buf_doc_end = long_doc_end
+            buffer, buf_doc_start, buf_doc_end = split_and_emit_oversized(
+                candidate, long_doc_start, para_end
+            )
 
     if buffer and (len(buffer) >= min_chunk_chars or not chunks):
         emit(buffer, buf_doc_start, buf_doc_end)
