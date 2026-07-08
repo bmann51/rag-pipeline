@@ -3,6 +3,7 @@ const els = {
   genBadge: document.getElementById("genBadge"),
   pdfFiles: document.getElementById("pdfFiles"),
   uploadBtn: document.getElementById("uploadBtn"),
+  warmupBtn: document.getElementById("warmupBtn"),
   resetBtn: document.getElementById("resetBtn"),
   ingestionResult: document.getElementById("ingestionResult"),
   queryInput: document.getElementById("queryInput"),
@@ -278,6 +279,25 @@ async function onUpload() {
   }
 }
 
+async function onWarmup() {
+  setStatus("Warming up embeddings...", "ok");
+  els.warmupBtn.disabled = true;
+  try {
+    const response = await fetch("/embeddings/warmup", { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || "Warmup failed");
+    }
+    renderIngestionResult(data);
+    setStatus(`Warmup: ${data.status} (${data.embedded_now} embedded, ${data.cached_after} cached)`, "ok");
+  } catch (error) {
+    renderIngestionResult({ error: String(error) });
+    setStatus(`Warmup failed: ${error}`, "warn");
+  } finally {
+    els.warmupBtn.disabled = false;
+  }
+}
+
 async function onReset() {
   setStatus("Resetting ingested data...", "ok");
   try {
@@ -335,6 +355,7 @@ async function onAsk() {
 }
 
 els.uploadBtn.addEventListener("click", onUpload);
+els.warmupBtn.addEventListener("click", onWarmup);
 els.resetBtn.addEventListener("click", onReset);
 els.askBtn.addEventListener("click", onAsk);
 
