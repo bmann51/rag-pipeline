@@ -156,8 +156,8 @@ Response fields of note:
 9. **Source-consistency bonus** — apply small tie-breaker for short queries over a consistent top window.
 10. **Await topic classifier** — collect the LLM result; resolve disclaimer string if `legal_topic` or `medical_topic`.
 11. **Evidence gate** — filter by relevance threshold and query-term coverage; return `insufficient_evidence` (with disclaimer if set) if nothing passes.
-12. **Answer generation** — call `mistral-small-latest` with an intent-shaped prompt; validate that the response contains citations mapping to retrieved chunk IDs.
-13. **Hallucination check** — split the answer into sentences; flag any sentence that shares no vocabulary with the retrieved chunks (overlap threshold: 15%).
+12. **Answer generation** — call `mistral-small-latest` with an intent-shaped prompt. If the model returns a hedge phrase (e.g. "I don't have enough evidence in the provided documents to answer that."), that response is surfaced directly to the user as `generated_answer` without requiring citations. For factual answers, citations are extracted from the response or inferred from token overlap with the retrieved chunks; if neither succeeds, the answer is still surfaced as `generated_answer` rather than discarded, flagged with `hallucination_warning: true` and an empty `cited_chunk_ids` so the caller knows it isn't traceable to a specific source.
+13. **Hallucination check** — for cited answers, split the answer into sentences and flag any sentence that shares no vocabulary with the retrieved chunks (overlap threshold: 15%). Uncited answers (previous step) are flagged wholesale via `hallucination_warning` without running this per-sentence check, so `unsupported_sentences` stays empty in that case even though the warning is set.
 
 ---
 
@@ -192,7 +192,7 @@ The `answer_intent` value is included in the response diagnostics.
 
 After a successful generation, each sentence in the answer is checked against the retrieved chunks. A sentence is flagged as unsupported if the overlap between its meaningful tokens and the tokens of every retrieved chunk falls below 15%.
 
-Short sentences (fewer than 5 meaningful tokens), hedge phrases ("I don't have enough evidence…"), and citation-only fragments are skipped. The check is post-hoc and non-blocking — the answer is still returned, but `hallucination_warning: true` and the specific `unsupported_sentences` are surfaced in the response so the caller can decide how to handle them.
+Short sentences (fewer than 5 meaningful tokens), hedge phrases ("I don't have enough evidence…"), and citation-only fragments are skipped. When the entire LLM response is a hedge phrase it is returned as `generated_answer` directly and the hallucination check is bypassed — the model is accurately reflecting the limits of its context, not hallucinating. When an answer has real content but no citation can be extracted or inferred, it's flagged with `hallucination_warning: true` directly, without running the per-sentence check — `unsupported_sentences` will be empty in that case, since the whole answer is being flagged for lacking a traceable source rather than for any specific sentence failing the overlap test. The per-sentence check itself is post-hoc and non-blocking for cited answers — the answer is still returned, but `hallucination_warning: true` and the specific `unsupported_sentences` are surfaced in the response so the caller can decide how to handle them.
 
 **Why 15% and not stricter?** A higher threshold risks false positives when the LLM paraphrases with synonyms not in the chunks. 15% is a reasonable estimate, not a value swept against the scorecard.
 ---
@@ -214,7 +214,7 @@ All state is stored as newline-delimited JSON files under `data/`:
 
 - Model: `mistral-embed` (configurable via `MISTRAL_EMBEDDING_MODEL`)
 - Embeddings are generated lazily during queries and cached to disk
-- `POST /embeddings/warmup` pre-generates all missing embeddings upfront (useful before a demo)
+- `POST /embeddings/warmup` pre-generates all missing embeddings upfront (useful before a demo); the browser UI exposes this as a one-click **Warm Up Embeddings** button in the Ingestion panel
 - Rate-limit resilience: request pacing + exponential backoff on 429s
 
 ---
@@ -371,6 +371,7 @@ curl -X DELETE "http://127.0.0.1:8000/ingestion/reset"
 | `app/ingestion/pdf_ingestor.py` | PDF text extraction and OCR fallback |
 | `app/ingestion/chunker.py` | Document-level, paragraph-aware chunking with page-offset attribution |
 | `app/storage/document_store.py` | JSONL persistence for documents and chunks |
+| `app/storage/chunk_reader.py` | Chunk loading with in-memory cache; invalidated on ingest or reset |
 | `app/storage/embedding_store.py` | JSONL persistence for chunk embeddings |
 | `app/schemas.py` | Pydantic request/response models |
 | `app/config.py` | Typed settings with environment variable overrides |
