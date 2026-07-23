@@ -42,8 +42,6 @@ All pages are concatenated into a single document string, with each page's chara
 
 **Why document-level rather than page-scoped?** The old per-page approach truncated chunks at page boundaries even when a sentence or paragraph ran across the boundary, producing an artificially cut-off chunk from the bottom of one page and an orphaned fragment at the top of the next. Running over the full document lets the chunker respect paragraph boundaries wherever they actually fall; the page attribution is still precise because it is computed from recorded character offsets, not assumed from the chunking boundary.
 
-**Trade-off:** Very short pages (captions, headers-only) may produce chunks below `min_chunk_chars` (250 characters) and are skipped. This means caption-only figures are not retrievable; a future improvement would be image OCR for figure captions.
-
 **OCR fallback:** If `pypdf` extracts no text (scanned PDFs), the file is uploaded to Mistral OCR (`mistral-ocr-latest`), which returns Markdown per page. The same chunker runs on the Markdown output. The uploaded file is always deleted from Mistral's servers after processing.
 
 ---
@@ -195,6 +193,7 @@ After a successful generation, each sentence in the answer is checked against th
 Short sentences (fewer than 5 meaningful tokens), hedge phrases ("I don't have enough evidence…"), and citation-only fragments are skipped. When the entire LLM response is a hedge phrase it is returned as `generated_answer` directly and the hallucination check is bypassed — the model is accurately reflecting the limits of its context, not hallucinating. When an answer has real content but no citation can be extracted or inferred, it's flagged with `hallucination_warning: true` directly, without running the per-sentence check — `unsupported_sentences` will be empty in that case, since the whole answer is being flagged for lacking a traceable source rather than for any specific sentence failing the overlap test. The per-sentence check itself is post-hoc and non-blocking for cited answers — the answer is still returned, but `hallucination_warning: true` and the specific `unsupported_sentences` are surfaced in the response so the caller can decide how to handle them.
 
 **Why 15% and not stricter?** A higher threshold risks false positives when the LLM paraphrases with synonyms not in the chunks. 15% is a reasonable estimate, not a value swept against the scorecard.
+
 ---
 
 ## Storage and Persistence
